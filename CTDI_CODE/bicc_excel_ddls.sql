@@ -1,19 +1,18 @@
 -- =====================================================================================================
 -- ERP - BICC EXCEL INGESTION  |  DDLs + one-file test metadata
--- Catalog/schema: edl_prod.drvd__app_bicc
+-- Catalog/schema: edl_dev.drvd__app_ctdi
 -- =====================================================================================================
 
 -- -----------------------------------------------------------------------------------------------------
 -- 0) Remove load_type table - no longer required (full/delta + count checks were dropped)
--- -----------------------------------------------------------------------------------------------------
-DROP TABLE IF EXISTS edl_prod.drvd__app_bicc.bicc_load_type;
+-- ----------------------------------------------------------------------------------------------------
 
 
 -- -----------------------------------------------------------------------------------------------------
 -- 1) METADATA TABLE  (drives, per tab, the rename + PK-only validation + JSON folding)
 --    Key = (file_name_prefix, sheet_tab_name).  One row per source column.
 -- -----------------------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_table_metadata (
+CREATE TABLE IF NOT EXISTS edl_dev.drvd__app_ctdi.bicc_table_metadata (
   serial_number         BIGINT,        -- surrogate row id (optional)
   batch_id              STRING,        -- feed/batch grouping label
   file_name_prefix      STRING,        -- file name with the trailing date stripped (e.g. Rogers_Shaw_STB_OHB_Comparison)
@@ -33,7 +32,7 @@ CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_table_metadata (
 -- -----------------------------------------------------------------------------------------------------
 -- 2) PROCESS CONTROL  (one row per tab/table)
 -- -----------------------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_process_control (
+CREATE TABLE IF NOT EXISTS edl_dev.drvd__app_ctdi.bicc_process_control (
   execution_id              STRING,         -- run id
   process_id                STRING,         -- UNIQUE per tab/table (same id used in the error table for that tab)
   batch_id                  STRING,         -- yyyymmddHHMMSS parsed from the file name
@@ -59,7 +58,7 @@ CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_process_control (
 --    Column order as requested: PROCESS_ID, FILE_NAME, TABLE_NAME, FILE_PATH, ERR_RECORD, COMMENTS, AZ_INSERT_TS
 --    EXECUTION_ID + SHEET_TAB_NAME added as required audit columns (tie an error back to a run/tab).
 -- -----------------------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_ingestion_err_table (
+CREATE TABLE IF NOT EXISTS edl_dev.drvd__app_ctdi.bicc_ingestion_err_table (
   process_id      STRING,
   execution_id    STRING,
   file_name       STRING,
@@ -78,7 +77,7 @@ CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_ingestion_err_table (
 -- =====================================================================================================
 
 -- ---- Tab 1 : 'OHB Comparison'  ->  table ohb_comparison  (PK = SERIAL_NUMBER + CTDI_SERIAL_NUMBER_ID) ----
-INSERT INTO edl_prod.drvd__app_bicc.bicc_table_metadata
+INSERT INTO edl_dev.drvd__app_ctdi.bicc_table_metadata
 (serial_number, batch_id, file_name_prefix, sheet_tab_name, table_name,
  sheet_column_name, original_column_name, array_column_name, column_order, data_type, is_primary_key,
  _az_insert_ts, _az_update_ts)
@@ -113,7 +112,7 @@ VALUES
 (28,'BICC_INT_680','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','RECEIVE_SHIP_YEAR_SORT','RECEIVE_SHIP_YEAR_SORT','DATA',28,'int'    ,false,current_timestamp(),current_timestamp());
 
 -- ---- Tab 2 : 'OHB Nonserial Comparison'  ->  table ohb_nonserial_comparison  (PK = PART_NUMBER + STOCK_LOCATION_ID) ----
-INSERT INTO edl_prod.drvd__app_bicc.bicc_table_metadata
+INSERT INTO edl_dev.drvd__app_ctdi.bicc_table_metadata
 (serial_number, batch_id, file_name_prefix, sheet_tab_name, table_name,
  sheet_column_name, original_column_name, array_column_name, column_order, data_type, is_primary_key,
  _az_insert_ts, _az_update_ts)
@@ -133,6 +132,6 @@ VALUES
 -- =====================================================================================================
 -- SELECT sheet_tab_name, table_name, count(*) cols,
 --        concat_ws(',', collect_list(case when is_primary_key then original_column_name end)) pk
--- FROM edl_prod.drvd__app_bicc.bicc_table_metadata
+-- FROM edl_dev.drvd__app_ctdi.bicc_table_metadata
 -- WHERE file_name_prefix='Rogers_Shaw_STB_OHB_Comparison'
 -- GROUP BY sheet_tab_name, table_name;
