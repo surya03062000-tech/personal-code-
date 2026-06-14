@@ -48,6 +48,7 @@ from pyspark.storagelevel import StorageLevel
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 
 # COMMAND ----------
 
@@ -111,7 +112,22 @@ spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 # E-mail subject is FIXED in code now (removed from the widget/config per request).
 EMAIL_SUBJECT = 'Failed | CTDI Excel File'
 
-print(f"Mode={'PROD (decrypt)' if DECRYPT_FLAG else 'TEST (direct xlsx)'} | execution_id={execution_id}")
+# exit_on_finish = "true"  (PROD/job): call dbutils.notebook.exit() so the orchestrator gets the JSON.
+# exit_on_finish = "false" (TEST)    : DON'T exit, so the *next cell* runs and can show the step log/summary.
+EXIT_ON_FINISH = str(notebook_config['processing'].get('exit_on_finish', 'true')).lower() == 'true'
+EMAIL_VERBOSE  = str(notebook_config['email'].get('verbose', 'false')).lower() == 'true'
+
+# Step-by-step run log: every milestone is appended here AND printed live.
+# The "next cell" reads RUN_LOG / RUN_CONTROL_DF (populated only when exit_on_finish=false).
+RUN_LOG = []
+RUN_CONTROL_DF = None
+def log_step(msg, level='INFO'):
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}"
+    RUN_LOG.append(line)
+    print(line)
+
+print(f"Mode={'PROD (decrypt)' if DECRYPT_FLAG else 'TEST (direct xlsx)'} | execution_id={execution_id} "
+      f"| exit_on_finish={EXIT_ON_FINISH}")
 
 # COMMAND ----------
 
@@ -506,17 +522,31 @@ def resolve_output_folder(table_name, kind='curated'):
 # COMMAND ----------
 
 # DBTITLE 1,E-mail helpers
-def fn_sendEmail(sender, server, receivers, subject, html, port=25):
+def fn_sendEmail(sender, server, receivers, subject, html, port=25, debug=False):
+    """Returns (refused_dict, transcript). refused_dict == {} means the relay accepted for all recipients."""
     msg = MIMEMultipart('alternative', None, [MIMEText('Please view this e-mail in HTML.'),
                                               MIMEText(html, 'html')])
     msg['Subject'] = subject
     msg['From'] = sender
     rcpts = receivers if isinstance(receivers, list) else [r.strip() for r in str(receivers).split(',') if r.strip()]
     msg['To'] = ', '.join(rcpts)
-    s = smtplib.SMTP(server, int(port), timeout=30)   # timeout so a bad host fails fast, not hangs
+    msg['Date'] = formatdate(localtime=True)                      # proper headers reduce spam filtering
+    msg['Message-ID'] = make_msgid(domain=sender.split('@')[-1])
+
+    s = smtplib.SMTP(server, int(port), timeout=30)              # timeout so a bad host fails fast, not hangs
+    if debug:
+        import io, sys as _sys
+        buf = io.StringIO(); s.set_debuglevel(1)
+        old = _sys.stderr; _sys.stderr = buf                     # capture the SMTP conversation
+        try:
+            s.ehlo(); refused = s.sendmail(sender, rcpts, msg.as_string()); s.quit()
+        finally:
+            _sys.stderr = old
+        return refused, buf.getvalue()
     s.ehlo()
-    s.sendmail(sender, rcpts, msg.as_string())
+    refused = s.sendmail(sender, rcpts, msg.as_string())
     s.quit()
+    return refused, ''
 
 def _build_failure_html(failed_rows):
     """Advanced e-mail (your change #4): intro/contact text, THEN an error-details table."""
@@ -573,8 +603,15 @@ def send_failure_email(df_control):
         return ("EMAIL NOT SENT: email.server is blank/placeholder - "
                 "set config.email.server to a reachable SMTP host (e.g. 10.9.40.62)")
     try:
-        fn_sendEmail(cfg['sender'], server, cfg['receivers'], subject, html, cfg.get('port', 25))
-        return f'Failure e-mail SENT to {cfg["receivers"]} via {server} ({len(failed_rows)} failed sheet/file)'
+        refused, transcript = fn_sendEmail(cfg['sender'], server, cfg['receivers'],
+                                           subject, html, cfg.get('port', 25), debug=EMAIL_VERBOSE)
+        if EMAIL_VERBOSE and transcript:
+            print('----- SMTP transcript -----\n' + transcript + '\n---------------------------')
+        if refused:
+            # relay accepted the connection but REJECTED these recipients -> real "not delivered" reason
+            return f'EMAIL PARTIALLY REFUSED by {server}: {refused} (relay rejected these recipients)'
+        return (f'Failure e-mail handed to relay {server} for {cfg["receivers"]} '
+                f'({len(failed_rows)} failed sheet/file). If not received: check spam + relay delivery policy.')
     except Exception as e:
         # do NOT crash the job for an e-mail problem - report it clearly
         return (f'EMAIL NOT SENT: SMTP send failed via {server} - {e}. '
@@ -642,17 +679,16 @@ def write_control_rows(control_rows):
 if __name__ == '__main__':
     final_status, final_message = 0, 'Success'
     start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f'Job starts at {start_time}')
     control_rows = []
 
     try:
+        log_step(f'STEP 1 - Job start ({start_time}) | mode={"PROD" if DECRYPT_FLAG else "TEST"}')
         workbooks = list_workbooks()
-        print(f'Workbooks to process: {[w[2] for w in workbooks]}')
+        log_step(f'STEP 2 - Workbooks to process: {[w[2] for w in workbooks]}')
 
         for src_path, local_path, file_name in workbooks:
             file_prefix, batch_id, file_dttm = derive_file_meta(file_name)
-            print('=' * 110)
-            print(f'Workbook: {file_name} | prefix={file_prefix} | batch_id={batch_id}')
+            log_step(f'STEP 3 - Reading workbook: {file_name} | prefix={file_prefix} | batch_id={batch_id}')
 
             # #1 FILE-LEVEL isolation: a corrupt/unreadable workbook becomes ONE failed control row,
             #    we e-mail it and keep going - it never wipes other workbooks' results.
@@ -668,7 +704,7 @@ if __name__ == '__main__':
             for sheet_name, df_sheet, raw_cnt in sheets:
                 meta_rows = get_sheet_metadata(file_prefix, sheet_name)
                 if not meta_rows:
-                    print(f"  - tab '{sheet_name}' : no metadata configured -> skipped")
+                    log_step(f"tab '{sheet_name}' : no metadata configured -> skipped", level='SKIP')
                     continue
 
                 process_id = str(uuid.uuid4())
@@ -677,7 +713,7 @@ if __name__ == '__main__':
                 pk_cols  = [r['original_column_name'] or r['sheet_column_name'] for r in meta_rows if r['is_primary_key']]
                 pk_types = [r['data_type'] for r in meta_rows if r['is_primary_key']]
 
-                print(f"  - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols}")
+                log_step(f"STEP 4 - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols}")
 
                 raw_path, final_path, status_txt, comments = None, None, 'Failed', ''
                 dq_array, valid_cnt, err_cnt = list(NOT_RUN_DQ), 0, 0
@@ -701,19 +737,24 @@ if __name__ == '__main__':
                     # (a) land the sheet AS-IS as raw parquet (lineage)
                     raw_folder = resolve_output_folder(table_name, kind='raw')
                     raw_path = write_parquet(raw_folder, table_name, df_sheet_persisted)
+                    log_step(f"   STEP 4a - raw as-is parquet  -> {raw_path}")
 
                     # (b) map sheet columns -> final names
                     df_mapped, ordered_final = apply_column_mapping(df_sheet_persisted, meta_rows)
+                    log_step(f"   STEP 4b - columns mapped to final names ({len(ordered_final)} cols)")
 
                     # (c) PK-only validations (all checks run for every record)
                     df_val, dq_array, counts = run_pk_validations(df_mapped, pk_cols, pk_types)
                     valid_cnt = counts['total'] - counts['bad']
                     err_cnt   = counts['bad']
+                    log_step(f"   STEP 4c - PK checks done | dup={counts['dup']} null={counts['nul']} "
+                             f"dtype={counts['dty']} -> bad={err_cnt}, good={valid_cnt}")
 
                     # (d) bad records -> error table
                     if err_cnt > 0:
                         insert_error_records(df_val.where(col('COMMENTS') != lit('')),
                                              process_id, file_name, table_name, sheet_name, src_path)
+                        log_step(f"   STEP 4d - {err_cnt} bad record(s) -> {ERROR_TABLE}", level='WARN')
 
                     # (e) good records -> curated parquet (PK_DERIVED first + PK + JSON DATA + meta cols)
                     df_good = df_val.where(col('COMMENTS') == lit('')).drop('COMMENTS')
@@ -721,6 +762,7 @@ if __name__ == '__main__':
                                                   array_col, file_dttm, file_name)
                     cur_folder = resolve_output_folder(table_name, kind='curated')
                     final_path = write_parquet(cur_folder, table_name, df_curated)
+                    log_step(f"   STEP 4e - curated parquet    -> {final_path}")
 
                     if err_cnt == 0:
                         status_txt = 'Succeeded'
@@ -755,19 +797,23 @@ if __name__ == '__main__':
         try:
             if control_rows:
                 df_control = write_control_rows(control_rows)
+                globals()['RUN_CONTROL_DF'] = df_control          # expose to the next cell
+                log_step(f'STEP 5 - {len(control_rows)} control row(s) written to {PROCESS_CONTROL}')
+
                 # tuple layout: 3=file_name 4=sheet 5=table 12=err_cnt 13=status 14=comments
                 failed = [r for r in control_rows if r[13] != 'Succeeded']
                 n_ok, n_failed = len(control_rows) - len(failed), len(failed)
-                email_status = send_failure_email(df_control)   # ONE mail for all failures
 
-                # ---- human-readable summary printed to the cell output ----
-                print('=' * 110)
-                print(f'RUN SUMMARY : {n_ok} succeeded | {n_failed} FAILED')
+                email_status = send_failure_email(df_control)     # ONE mail for ALL failures
+                log_step(f'STEP 6 - {email_status}')
+
+                # ---- human-readable summary (also captured in RUN_LOG for the next cell) ----
+                log_step('=' * 90)
+                log_step(f'RUN SUMMARY : {n_ok} succeeded | {n_failed} FAILED')
                 for r in control_rows:
-                    print(f"  [{r[13]:9}] file={r[3]} | tab={r[4]} | table={r[5]} | "
-                          f"rows={r[10]} valid={r[11]} err={r[12]} | {r[14]}")
-                print(f'EMAIL : {email_status}')
-                print('=' * 110)
+                    log_step(f"  [{r[13]:9}] file={r[3]} | tab={r[4]} | table={r[5]} | "
+                             f"rows={r[10]} valid={r[11]} err={r[12]} | {r[14]}")
+                log_step('=' * 90)
 
                 # ---- surface the failures in the EXIT message (job still SUCCESS) ----
                 if final_status == 0:
@@ -783,5 +829,41 @@ if __name__ == '__main__':
                     final_message = 'Success | No configured tabs were found to process.'
         except Exception as e:
             final_status, final_message = 1, 'Failed writing control table / e-mail - ' + str(e)
+
         df_metadata_all.unpersist()
-        fn_exitFinalDatabricks(start_time, final_status, final_message)
+        globals()['RUN_FINAL'] = {'status': final_status, 'message': final_message}
+
+        if EXIT_ON_FINISH:
+            # PROD/job: hand the JSON to the orchestrator (this STOPS the notebook - no later cell runs).
+            fn_exitFinalDatabricks(start_time, final_status, final_message)
+        else:
+            # TEST: do NOT exit, so the next cell can show the step-by-step log + summary.
+            log_step("exit_on_finish=false -> notebook NOT exited; run the NEXT cell for the step log & summary.")
+            print(json.dumps({'status': final_status, 'message': final_message}, indent=1))
+
+# COMMAND ----------
+
+# DBTITLE 1,NEXT CELL - step-by-step run log + summary (runs only when exit_on_finish=false)
+# This cell only executes when the main cell did NOT call dbutils.notebook.exit()
+# (i.e. processing.exit_on_finish = "false"). In PROD the notebook exits above and this cell is skipped.
+
+print("================  STEP-BY-STEP RUN LOG  ================")
+for line in RUN_LOG:
+    print(line)
+
+print("\n================  FINAL RESULT  ================")
+print(json.dumps(RUN_FINAL, indent=1))
+
+# Per-tab control rows for this run (status, counts, dq array, parquet paths)
+if RUN_CONTROL_DF is not None:
+    print("\n================  PROCESS CONTROL (this run)  ================")
+    display(RUN_CONTROL_DF.select(
+        'file_name', 'sheet_tab_name', 'table_name', 'final_ingestion_status',
+        'source_row_count', 'valid_record_count', 'error_record_count',
+        'dq_check_validation', 'comments', 'final_parquet_source_raw'))
+
+    # Show the bad records written to the error table for this execution_id
+    print("\n================  ERROR RECORDS (this run)  ================")
+    display(spark.read.table(ERROR_TABLE).where(col('execution_id') == lit(execution_id)))
+else:
+    print("No control rows were produced (no configured tabs matched the metadata).")
