@@ -6,9 +6,9 @@
                  "source_path":"",
                  "header_row_index":"1",
                  "data_start_row_index":"2"},
-  "validations":{"metadata_table":"drvd__app_bicc.bicc_table_metadata",
-                 "error_table":"drvd__app_bicc.bicc_ingestion_err_table",
-                 "process_control":"drvd__app_bicc.bicc_process_control"},
+  "validations":{"metadata_table":"drvd__app_ctdi.bicc_table_metadata",
+                 "error_table":"drvd__app_ctdi.bicc_ingestion_err_table",
+                 "process_control":"drvd__app_ctdi.bicc_process_control"},
   "email":      {"sender":"${erp_email_sender}","receivers":"${erp_email_receivers}",
                  "server":"${erp_email_server}","subject":"Failed | ERP - BICC Excel File INT 680"}
 }
