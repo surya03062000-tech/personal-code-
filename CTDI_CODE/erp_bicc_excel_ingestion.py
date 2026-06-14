@@ -33,6 +33,7 @@ import json, os, re, base64, uuid, smtplib
 from datetime import datetime
 from pprint import pprint
 
+import pandas as pd
 from python_calamine import CalamineWorkbook
 
 from pyspark.sql import Window
@@ -98,11 +99,56 @@ METADATA_TABLE   = notebook_config['validations']['metadata_table']
 ERROR_TABLE      = notebook_config['validations']['error_table']
 PROCESS_CONTROL  = notebook_config['validations']['process_control']
 
-# Fixed metadata-column names written into every curated parquet (the "as usual" audit columns)
-META_COLS = ['PK_DERIVED', 'BATCH_ID', 'FILE_DTTM', 'SHEET_TAB_NAME',
-             'SOURCE_FILE_NAME', 'PROCESS_ID', 'EXECUTION_ID', '_AZ_INSERT_TS']
+# Curated parquet layout (your change #1):
+#   PK_DERIVED (FIRST) , <pk columns...> , <DATA json> , then these trailing metadata columns.
+#   Removed from the parquet: BATCH_ID, SHEET_TAB_NAME, PROCESS_ID, EXECUTION_ID
+#   (they still live in the control / error tables for traceability).
+CURATED_META_COLS = ['FILE_DTTM', 'SOURCE_FILE_NAME', '_AZ_INSERT_TS']
+
+# Arrow makes pandas <-> Spark conversion (the excel read, #7) much faster.
+spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
 print(f"Mode={'PROD (decrypt)' if DECRYPT_FLAG else 'TEST (direct xlsx)'} | execution_id={execution_id}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Validate config + tables up-front (#10) - fail fast with a clear message, not a raw KeyError
+def validate_config():
+    problems = []
+    # required config keys
+    required = {
+        'storage': ['adls_container', 'folder', 'source', 'frequency'],
+        'processing': ['decrypt_flag'],
+        'validations': ['metadata_table', 'error_table', 'process_control'],
+        'email': ['sender', 'receivers', 'server', 'subject'],
+    }
+    for section, keys in required.items():
+        if section not in notebook_config:
+            problems.append(f"missing config section '{section}'"); continue
+        for k in keys:
+            if k not in notebook_config[section]:
+                problems.append(f"missing config key '{section}.{k}'")
+
+    # mode-specific keys
+    if DECRYPT_FLAG:
+        if not (SOURCE_PATH or notebook_config['storage'].get('source')):
+            problems.append("PROD mode needs processing.source_path or storage.source")
+    else:
+        if not TEST_EXCEL_PATH:
+            problems.append("TEST mode needs processing.test_excel_path")
+
+    # the three control tables must exist and be readable
+    for t in [METADATA_TABLE, ERROR_TABLE, PROCESS_CONTROL]:
+        try:
+            spark.read.table(t).schema
+        except Exception as e:
+            problems.append(f"table '{t}' not readable - {str(e).splitlines()[0]}")
+
+    if problems:
+        raise Exception("Config/setup validation failed:\n  - " + "\n  - ".join(problems))
+    print("Config validation passed.")
+
+validate_config()
 
 # COMMAND ----------
 
@@ -294,8 +340,11 @@ def read_excel_sheets(local_path):
             r = (r + [None] * (ncol - len(r))) if len(r) < ncol else r[:ncol]
             norm.append([cell_to_str(v) for v in r])
 
+        # #7 perf: go via pandas + Arrow (faster + lower-overhead than createDataFrame(list))
         schema = StructType([StructField(c, StringType(), True) for c in header])
-        df = spark.createDataFrame(norm, schema) if norm else spark.createDataFrame([], schema)
+        pdf = pd.DataFrame(norm, columns=header, dtype=object)
+        pdf = pdf.where(pd.notnull(pdf), None)            # NaN -> None so Arrow writes proper nulls
+        df = spark.createDataFrame(pdf, schema=schema)
         results.append((sheet_name, df, len(norm)))
     return results
 
@@ -322,8 +371,9 @@ def apply_column_mapping(df_sheet, meta_rows):
 # DBTITLE 1,Primary-Key-only validations: duplicate + NOT NULL + datatype  (NO count / non-PK checks)
 def run_pk_validations(df, pk_cols, pk_types):
     """
-    Adds PK_DERIVED + COMMENTS. COMMENTS is '' for a clean record, else pipe-joined failure reasons.
-    Returns (df_with_comments, dq_check_validation_array, counts_dict).
+    ALL three PK checks run for EVERY record - no early exit, reasons accumulate (your change #3).
+    Each check is an explicit boolean flag column (#4) so the counts never depend on message text.
+    Returns (df_with_COMMENTS, dq_check_validation_array, counts_dict).
     """
     # 1) Derived PK (md5 of all PK columns) - composite-PK safe
     parts = []
@@ -332,43 +382,39 @@ def run_pk_validations(df, pk_cols, pk_types):
     pk_expr = "md5(concat(" + ", ".join(parts) + ", '~'))" if pk_cols else "md5('~')"
     df = df.withColumn('PK_DERIVED', expr(pk_expr))
 
-    # 2) NOT NULL check on every PK column
-    if pk_cols:
-        null_cond = " OR ".join([f"(`{c}` IS NULL OR trim(`{c}`) = '')" for c in pk_cols])
-        df = df.withColumn('CHK_NULL', when(expr(null_cond), lit('Mandatory PK field is NULL || ')).otherwise(lit('')))
-    else:
-        df = df.withColumn('CHK_NULL', lit(''))
+    # 2) NOT-NULL flag  (any PK column null/blank)
+    null_cond = " OR ".join([f"(`{c}` IS NULL OR trim(`{c}`) = '')" for c in pk_cols]) if pk_cols else "false"
+    df = df.withColumn('_F_NULL', expr(null_cond))
 
-    # 3) Datatype check on non-string PK columns (try_cast fails -> mismatch)
+    # 3) DATATYPE flag (non-string PK fails try_cast)
     dtype_conds = [
         f"(`{c}` IS NOT NULL AND trim(`{c}`) <> '' AND try_cast(`{c}` AS {t}) IS NULL)"
         for c, t in zip(pk_cols, pk_types) if t.lower() not in ('string', 'varchar', 'char')
     ]
-    if dtype_conds:
-        df = df.withColumn('CHK_DTYPE', when(expr(" OR ".join(dtype_conds)), lit('PK datatype mismatch || ')).otherwise(lit('')))
-    else:
-        df = df.withColumn('CHK_DTYPE', lit(''))
+    df = df.withColumn('_F_DTYPE', expr(" OR ".join(dtype_conds)) if dtype_conds else lit(False))
 
-    # 4) Duplicate PK check
-    df = df.withColumn('cnt_chk', count(lit(1)).over(Window.partitionBy('PK_DERIVED')))
-    df = df.withColumn('CHK_DUP', when(col('cnt_chk') > 1, lit('Duplicate Primary Key || ')).otherwise(lit(''))).drop('cnt_chk')
+    # 4) DUPLICATE flag
+    df = df.withColumn('_F_DUP', count(lit(1)).over(Window.partitionBy('PK_DERIVED')) > 1)
 
-    # combine into a single COMMENTS column
-    df = df.withColumn('COMMENTS', concat_ws('', col('CHK_NULL'), col('CHK_DTYPE'), col('CHK_DUP'))) \
-           .drop('CHK_NULL', 'CHK_DTYPE', 'CHK_DUP')
+    # COMMENTS built from the flags (all reasons accumulate)
+    df = df.withColumn('COMMENTS', concat_ws('',
+            when(col('_F_NULL'),  lit('Mandatory PK field is NULL || ')).otherwise(lit('')),
+            when(col('_F_DTYPE'), lit('PK datatype mismatch || ')).otherwise(lit('')),
+            when(col('_F_DUP'),   lit('Duplicate Primary Key || ')).otherwise(lit('')))) \
+           .withColumn('_F_BAD', col('COMMENTS') != lit(''))
     df.persist(StorageLevel.DISK_ONLY)
 
-    # one pass to get all the counts (cheaper than several .count() calls)
+    # counts in a single pass, summing the boolean flags (cast to int)
     agg = df.agg(
         count(lit(1)).alias('total'),
-        _sum(when(col('COMMENTS').contains('Duplicate'), 1).otherwise(0)).alias('dup'),
-        _sum(when(col('COMMENTS').contains('Mandatory PK'), 1).otherwise(0)).alias('nul'),
-        _sum(when(col('COMMENTS').contains('datatype'), 1).otherwise(0)).alias('dty'),
-        _sum(when(col('COMMENTS') != '', 1).otherwise(0)).alias('bad')
+        _sum(col('_F_DUP').cast('int')).alias('dup'),
+        _sum(col('_F_NULL').cast('int')).alias('nul'),
+        _sum(col('_F_DTYPE').cast('int')).alias('dty'),
+        _sum(col('_F_BAD').cast('int')).alias('bad'),
     ).collect()[0]
+    counts = {k: (agg[k] or 0) for k in ['total', 'dup', 'nul', 'dty', 'bad']}
 
-    counts = {'total': agg['total'] or 0, 'dup': agg['dup'] or 0, 'nul': agg['nul'] or 0,
-              'dty': agg['dty'] or 0, 'bad': agg['bad'] or 0}
+    df = df.drop('_F_NULL', '_F_DTYPE', '_F_DUP', '_F_BAD')
 
     dq_array = [
         f"Duplicate PK Check : {'PASS' if counts['dup'] == 0 else 'FAIL'} | duplicate_records={counts['dup']}",
@@ -396,8 +442,7 @@ def insert_error_records(df_bad, process_id, file_name, table_name, sheet_tab_na
 # COMMAND ----------
 
 # DBTITLE 1,Build the curated DF: PK as-is + all non-PK folded into one JSON column + metadata columns
-def build_curated_df(df_good, ordered_final, pk_cols, pk_types, array_col,
-                     batch_id, file_dttm, sheet_tab_name, source_file_name, process_id):
+def build_curated_df(df_good, ordered_final, pk_cols, pk_types, array_col, file_dttm, source_file_name):
     non_pk = [c for c in ordered_final if c not in pk_cols]
 
     # PK columns kept as-is but cast to their declared datatype
@@ -407,16 +452,13 @@ def build_curated_df(df_good, ordered_final, pk_cols, pk_types, array_col,
     json_col = to_json(struct(*[col(f'`{c}`').alias(c) for c in non_pk])).alias(array_col) if non_pk \
         else lit('{}').alias(array_col)
 
-    df = df_good.select(*pk_select, json_col, col('PK_DERIVED')) \
-                .withColumn('BATCH_ID', lit(batch_id)) \
+    # PK_DERIVED FIRST, then PK cols, then DATA, then trailing metadata cols (your change #1)
+    df = df_good.select(col('PK_DERIVED'), *pk_select, json_col) \
                 .withColumn('FILE_DTTM', lit(file_dttm).cast(TimestampType())) \
-                .withColumn('SHEET_TAB_NAME', lit(sheet_tab_name)) \
                 .withColumn('SOURCE_FILE_NAME', lit(source_file_name)) \
-                .withColumn('PROCESS_ID', lit(process_id)) \
-                .withColumn('EXECUTION_ID', lit(execution_id)) \
                 .withColumn('_AZ_INSERT_TS', current_timestamp())
 
-    final_order = pk_cols + [array_col] + META_COLS
+    final_order = ['PK_DERIVED'] + pk_cols + [array_col] + CURATED_META_COLS
     return df.select(*final_order)
 
 # COMMAND ----------
@@ -425,7 +467,7 @@ def build_curated_df(df_good, ordered_final, pk_cols, pk_types, array_col,
 def write_parquet(target_folder, table_name, df):
     tmp = f"{target_folder}/{table_name}_tmp"
     final = f"{target_folder}/{table_name}.parquet"
-    df.repartition(1).write.mode('overwrite').parquet(tmp)
+    df.coalesce(1).write.mode('overwrite').parquet(tmp)   # #8: coalesce avoids a full shuffle
     part = [f.path for f in dbutils.fs.ls(tmp) if f.path.endswith('.parquet')][0]
     try:
         dbutils.fs.rm(final)          # idempotent for re-runs in the same dated folder
@@ -461,41 +503,77 @@ def resolve_output_folder(table_name, kind='curated'):
 # COMMAND ----------
 
 # DBTITLE 1,E-mail helpers
-def fn_sendEmail(sender, server, receivers, subject, html):
-    msg = MIMEMultipart('alternative', None, [MIMEText(html), MIMEText(html, 'html')])
+def fn_sendEmail(sender, server, receivers, subject, html, port=25):
+    msg = MIMEMultipart('alternative', None, [MIMEText('Please view this e-mail in HTML.'),
+                                              MIMEText(html, 'html')])
     msg['Subject'] = subject
     msg['From'] = sender
-    msg['To'] = ', '.join(receivers) if isinstance(receivers, list) else receivers
-    s = smtplib.SMTP(server); s.ehlo()
-    s.sendmail(sender, receivers, msg.as_string()); s.quit()
+    rcpts = receivers if isinstance(receivers, list) else [r.strip() for r in str(receivers).split(',') if r.strip()]
+    msg['To'] = ', '.join(rcpts)
+    s = smtplib.SMTP(server, int(port), timeout=30)   # timeout so a bad host fails fast, not hangs
+    s.ehlo()
+    s.sendmail(sender, rcpts, msg.as_string())
+    s.quit()
+
+def _build_failure_html(failed_rows):
+    """Advanced e-mail (your change #4): intro/contact text, THEN an error-details table."""
+    th = 'style="border:1px solid #888;padding:6px 10px;background:#c00020;color:#fff;text-align:left;"'
+    td = 'style="border:1px solid #888;padding:6px 10px;"'
+    rows_html = ""
+    for r in failed_rows:
+        rows_html += (
+            f"<tr>"
+            f"<td {td}>{r['file_name']}</td>"
+            f"<td {td}>{r['table_name'] or '-'}</td>"
+            f"<td {td}>{r['sheet_tab_name'] or '-'}</td>"
+            f"<td {td} align='right'>{r['error_record_count']}</td>"
+            f"<td {td}>{(r['comments'] or '').replace('||', '<br>')}</td>"
+            f"</tr>"
+        )
+    return f"""
+    <html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222;">
+      <p>Dear Team,<br><br>
+      The below ERP&nbsp;-&nbsp;BICC <b>Excel</b> feed(s) reported issues during ingestion.<br>
+      Full details: process control table <b>{PROCESS_CONTROL}</b>; errored records: <b>{ERROR_TABLE}</b>
+      (filter by the matching <i>process_id</i>).<br><br>
+      Thanks,<br>ED&amp;A Auto Email Alerts<br>
+      <span style="color:#666;">--------------------------------------------------------------<br>
+      Auto-generated e-mail - please do not reply.<br>
+      For support contact #RSO_BI Prod Supp - Azure : prodsuppazure@rci.rogers.com<br>
+      --------------------------------------------------------------</span>
+      </p>
+      <table style="border-collapse:collapse;font-size:12px;">
+        <tr>
+          <th {th}>File Name</th><th {th}>Table Name</th><th {th}>Sheet / Tab</th>
+          <th {th}>Error Records</th><th {th}>Error Reason</th>
+        </tr>
+        {rows_html}
+      </table>
+    </body></html>"""
 
 def send_failure_email(df_control):
     cfg = notebook_config['email']
-    subject = cfg['subject'] + ' | Run date - ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
-    failed = df_control.filter(col('final_ingestion_status') != lit('Succeeded')) \
-                       .select('execution_id', 'process_id', 'file_name', 'sheet_tab_name',
-                               'table_name', 'final_ingestion_status', 'comments')
-    if failed.count() == 0:
+    failed_rows = df_control.filter(col('final_ingestion_status') != lit('Succeeded')) \
+                            .select('file_name', 'table_name', 'sheet_tab_name',
+                                    'error_record_count', 'comments').collect()
+    if not failed_rows:
         print('No failures - no e-mail sent.')
         return
-    html = f"""
-    <html><body><p>Dear Team,<br><br>
-    The below ERP-BICC <b>Excel</b> feeds failed during ingestion.<br>
-    Process control table - {PROCESS_CONTROL} (filter by the execution_id / process_id below).<br>
-    Errored records are in - {ERROR_TABLE}.<br><br>
-    Thanks,<br>ED&amp;A Auto Email Alerts<br>
-    (auto-generated, do not reply - contact prodsuppazure@rci.rogers.com)<br></p>
-    {failed.toPandas().to_html(index=False)}
-    </body></html>"""
-    # best-effort: a missing/unreachable SMTP server must not mask the real ingestion status
+    subject = cfg['subject'] + ' | Run date - ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+    html = _build_failure_html(failed_rows)
+    server = cfg.get('server', '')
+    # "email not sent" fix: only an unresolved ${placeholder} or blank host is skipped, and we say so loudly.
+    if (not server) or server.startswith('${'):
+        print("EMAIL NOT SENT: email.server is blank or still a '${...}' placeholder. "
+              "Substitute the real SMTP host (e.g. 10.9.40.62) in config.email.server to send.")
+        return
     try:
-        if cfg.get('server') and not cfg['server'].startswith('${'):
-            fn_sendEmail(cfg['sender'], cfg['server'], cfg['receivers'], subject, html)
-            print('Failure e-mail sent.')
-        else:
-            print('SMTP server not configured - skipping e-mail (test mode).')
+        fn_sendEmail(cfg['sender'], server, cfg['receivers'], subject, html, cfg.get('port', 25))
+        print(f'Failure e-mail sent to {cfg["receivers"]} via {server}.')
     except Exception as e:
-        print(f'WARN: failure e-mail could not be sent ({e}). Continuing.')
+        # do NOT crash the job for an e-mail problem - report it clearly
+        print(f'EMAIL NOT SENT: SMTP send failed via {server} - {e}. '
+              f'Check cluster network access to the SMTP host and the sender/receiver values.')
 
 # COMMAND ----------
 
@@ -534,6 +612,28 @@ def list_workbooks():
 # COMMAND ----------
 
 # DBTITLE 1,MAIN - per workbook, per tab: validate -> curate -> parquet -> control row (isolated)
+NOT_RUN_DQ = ['Duplicate PK Check : NOT RUN', 'Not Null PK Check : NOT RUN', 'Data Type Check : NOT RUN']
+
+def write_control_rows(control_rows):
+    control_schema = StructType([
+        StructField('execution_id', StringType()),  StructField('process_id', StringType()),
+        StructField('batch_id', StringType()),       StructField('file_name', StringType()),
+        StructField('sheet_tab_name', StringType()), StructField('table_name', StringType()),
+        StructField('source_file_path', StringType()), StructField('raw_parquet_path', StringType()),
+        StructField('final_parquet_source_raw', StringType()),
+        StructField('dq_check_validation', ArrayType(StringType())),
+        StructField('source_row_count', LongType()), StructField('valid_record_count', LongType()),
+        StructField('error_record_count', LongType()),
+        StructField('final_ingestion_status', StringType()), StructField('comments', StringType()),
+        StructField('file_dttm', TimestampType()),
+    ])
+    df_control = spark.createDataFrame(control_rows, control_schema) \
+                      .withColumn('_az_insert_ts', current_timestamp())
+    ctrl_cols = spark.read.table(PROCESS_CONTROL).columns
+    df_control.select(*ctrl_cols).write.insertInto(PROCESS_CONTROL, overwrite=False)
+    return df_control
+
+
 if __name__ == '__main__':
     final_status, final_message = 0, 'Success'
     start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -549,7 +649,16 @@ if __name__ == '__main__':
             print('=' * 110)
             print(f'Workbook: {file_name} | prefix={file_prefix} | batch_id={batch_id}')
 
-            sheets = read_excel_sheets(local_path)
+            # #1 FILE-LEVEL isolation: a corrupt/unreadable workbook becomes ONE failed control row,
+            #    we e-mail it and keep going - it never wipes other workbooks' results.
+            try:
+                sheets = read_excel_sheets(local_path)
+            except Exception as e:
+                msg = f'Workbook could not be read - {str(e)}'
+                print(f'  !! {msg}')
+                control_rows.append((execution_id, str(uuid.uuid4()), batch_id, file_name, None, None,
+                                     src_path, None, None, NOT_RUN_DQ, 0, 0, 0, 'Failed', msg, file_dttm))
+                continue
 
             for sheet_name, df_sheet, raw_cnt in sheets:
                 meta_rows = get_sheet_metadata(file_prefix, sheet_name)
@@ -566,21 +675,32 @@ if __name__ == '__main__':
                 print(f"  - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols}")
 
                 raw_path, final_path, status_txt, comments = None, None, 'Failed', ''
-                dq_array = []
-                valid_cnt = err_cnt = 0
+                dq_array, valid_cnt, err_cnt = list(NOT_RUN_DQ), 0, 0
+                df_sheet_persisted, df_val = None, None
 
                 try:
                     if df_sheet is None or raw_cnt == 0:
                         raise Exception('No data rows found in the sheet.')
 
+                    # #5: configured PK column must actually exist in the sheet - fail with a CLEAR reason
+                    sheet_cols = set(df_sheet.columns)
+                    missing_pk = [r['sheet_column_name'] for r in meta_rows
+                                  if r['is_primary_key'] and r['sheet_column_name'] not in sheet_cols]
+                    if missing_pk:
+                        raise Exception(f"Configured PK column(s) {missing_pk} not found in sheet "
+                                        f"'{sheet_name}'. Sheet columns: {sorted(sheet_cols)}")
+
+                    # #9: persist the sheet once - it is used by the raw write, mapping and validation
+                    df_sheet_persisted = df_sheet.persist(StorageLevel.DISK_ONLY)
+
                     # (a) land the sheet AS-IS as raw parquet (lineage)
                     raw_folder = resolve_output_folder(table_name, kind='raw')
-                    raw_path = write_parquet(raw_folder, table_name, df_sheet)
+                    raw_path = write_parquet(raw_folder, table_name, df_sheet_persisted)
 
                     # (b) map sheet columns -> final names
-                    df_mapped, ordered_final = apply_column_mapping(df_sheet, meta_rows)
+                    df_mapped, ordered_final = apply_column_mapping(df_sheet_persisted, meta_rows)
 
-                    # (c) PK-only validations
+                    # (c) PK-only validations (all checks run for every record)
                     df_val, dq_array, counts = run_pk_validations(df_mapped, pk_cols, pk_types)
                     valid_cnt = counts['total'] - counts['bad']
                     err_cnt   = counts['bad']
@@ -590,29 +710,30 @@ if __name__ == '__main__':
                         insert_error_records(df_val.where(col('COMMENTS') != lit('')),
                                              process_id, file_name, table_name, sheet_name, src_path)
 
-                    # (e) good records -> curated parquet (PK as-is + JSON data column + metadata cols)
+                    # (e) good records -> curated parquet (PK_DERIVED first + PK + JSON DATA + meta cols)
                     df_good = df_val.where(col('COMMENTS') == lit('')).drop('COMMENTS')
-                    df_curated = build_curated_df(df_good, ordered_final, pk_cols, pk_types, array_col,
-                                                  batch_id, file_dttm, sheet_name, file_name, process_id)
+                    df_curated = build_curated_df(df_good, ordered_final, pk_cols, pk_types,
+                                                  array_col, file_dttm, file_name)
                     cur_folder = resolve_output_folder(table_name, kind='curated')
                     final_path = write_parquet(cur_folder, table_name, df_curated)
-
-                    df_val.unpersist()
 
                     if err_cnt == 0:
                         status_txt = 'Succeeded'
                         comments   = 'All primary-key checks passed.'
                     else:
-                        status_txt = 'Failed'
+                        status_txt = 'Failed'   # reported + e-mailed, but the JOB still succeeds (your change #2)
                         comments   = (f"{err_cnt} record(s) failed PK validation -> {ERROR_TABLE}. "
                                       f"Good records ({valid_cnt}) written to {final_path}.")
 
                 except Exception as e:
                     status_txt = 'Failed'
                     comments   = f'Tab processing failed - {str(e)}'
-                    if not dq_array:
-                        dq_array = ['Duplicate PK Check : NOT RUN', 'Not Null PK Check : NOT RUN', 'Data Type Check : NOT RUN']
                     print(f"    !! {comments}")
+                finally:
+                    if df_val is not None:
+                        df_val.unpersist()
+                    if df_sheet_persisted is not None:
+                        df_sheet_persisted.unpersist()
 
                 control_rows.append((
                     execution_id, process_id, batch_id, file_name, sheet_name, table_name,
@@ -620,34 +741,21 @@ if __name__ == '__main__':
                     int(raw_cnt), int(valid_cnt), int(err_cnt), status_txt, comments, file_dttm
                 ))
 
-        # ---- write all control rows in one shot ----
-        if control_rows:
-            control_schema = StructType([
-                StructField('execution_id', StringType()),  StructField('process_id', StringType()),
-                StructField('batch_id', StringType()),       StructField('file_name', StringType()),
-                StructField('sheet_tab_name', StringType()), StructField('table_name', StringType()),
-                StructField('source_file_path', StringType()), StructField('raw_parquet_path', StringType()),
-                StructField('final_parquet_source_raw', StringType()),
-                StructField('dq_check_validation', ArrayType(StringType())),
-                StructField('source_row_count', LongType()), StructField('valid_record_count', LongType()),
-                StructField('error_record_count', LongType()),
-                StructField('final_ingestion_status', StringType()), StructField('comments', StringType()),
-                StructField('file_dttm', TimestampType()),
-            ])
-            df_control = spark.createDataFrame(control_rows, control_schema) \
-                              .withColumn('_az_insert_ts', current_timestamp())
-            ctrl_cols = spark.read.table(PROCESS_CONTROL).columns
-            df_control.select(*ctrl_cols).write.insertInto(PROCESS_CONTROL, overwrite=False)
-
-            # ---- failure e-mail (and fail the job if anything failed) ----
-            send_failure_email(df_control)
-            if df_control.filter(col('final_ingestion_status') != lit('Succeeded')).count() > 0:
-                raise Exception('One or more tabs failed ingestion - see process control / error table / e-mail.')
-        else:
-            print('No configured tabs were found to process.')
-
     except Exception as e:
+        # only batch-level / infra problems (e.g. list_workbooks) reach here -> the job genuinely fails
         final_status, final_message = 1, 'Failed | Please debug - Error - ' + str(e)
+
     finally:
+        # always persist whatever we processed + e-mail any failures (your change #2: no job failure on DQ issues)
+        try:
+            if control_rows:
+                df_control = write_control_rows(control_rows)
+                n_failed = df_control.filter(col('final_ingestion_status') != lit('Succeeded')).count()
+                print(f'Control rows written: {len(control_rows)} | failed tabs/files: {n_failed}')
+                send_failure_email(df_control)   # job stays SUCCESS; failures are reported via control table + e-mail
+            else:
+                print('No configured tabs were found to process.')
+        except Exception as e:
+            final_status, final_message = 1, 'Failed writing control table / e-mail - ' + str(e)
         df_metadata_all.unpersist()
         fn_exitFinalDatabricks(start_time, final_status, final_message)

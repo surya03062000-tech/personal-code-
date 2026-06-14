@@ -4,26 +4,24 @@ This is what **one curated `.parquet`** looks like for a single tab. PK columns 
 **every non-PK column is folded into the single JSON `DATA` column**, then the standard metadata columns
 are appended.
 
-## Schema of the curated parquet
-| column | type | notes |
-|---|---|---|
-| `PART_NUMBER` | string | PK — kept as-is |
-| `STOCK_LOCATION_ID` | string | PK — kept as-is |
-| `DATA` | string (JSON) | all non-PK columns folded here (`array_column_name` from metadata) |
-| `PK_DERIVED` | string | md5(PART_NUMBER + STOCK_LOCATION_ID) |
-| `BATCH_ID` | string | parsed from file name `20260610000000` |
-| `FILE_DTTM` | timestamp | parsed from file name |
-| `SHEET_TAB_NAME` | string | `OHB Nonserial Comparison` |
-| `SOURCE_FILE_NAME` | string | `Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx` |
-| `PROCESS_ID` | string | unique per tab (matches process_control / error table) |
-| `EXECUTION_ID` | string | run id |
-| `_AZ_INSERT_TS` | timestamp | load time |
+## Schema of the curated parquet  (PK_DERIVED first; BATCH_ID / SHEET_TAB_NAME / PROCESS_ID / EXECUTION_ID removed)
+| # | column | type | notes |
+|---|---|---|---|
+| 1 | `PK_DERIVED` | string | **first column** — md5(PART_NUMBER + STOCK_LOCATION_ID) |
+| 2 | `PART_NUMBER` | string | PK — kept as-is |
+| 3 | `STOCK_LOCATION_ID` | string | PK — kept as-is |
+| 4 | `DATA` | string (JSON) | all non-PK columns folded here (`array_column_name` from metadata) |
+| 5 | `FILE_DTTM` | timestamp | parsed from file name |
+| 6 | `SOURCE_FILE_NAME` | string | `Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx` |
+| 7 | `_AZ_INSERT_TS` | timestamp | load time |
+
+> `BATCH_ID`, `SHEET_TAB_NAME`, `PROCESS_ID`, `EXECUTION_ID` are **not** in the parquet anymore — they remain in `bicc_process_control` / `bicc_ingestion_err_table` for traceability.
 
 ## Sample rows (rendered)
-| PART_NUMBER | STOCK_LOCATION_ID | DATA | PK_DERIVED | BATCH_ID | SHEET_TAB_NAME |
-|---|---|---|---|---|---|
-| 0151000162 | OAK-A12 | `{"CTDI_COMP_DATE":"2026-06-10","SHAW_COMP_DATE":"2026-06-10","PARTTYPE":"STB","CTDI_QUANTITY":"5","SHAW_QUANTITY":"5","DELTA_QUANTITY":"0"}` | 3f8a…e1 | 20260610000000 | OHB Nonserial Comparison |
-| 0151000177 | OAK-B03 | `{"CTDI_COMP_DATE":"2026-06-10","SHAW_COMP_DATE":"2026-06-10","PARTTYPE":"MODEM","CTDI_QUANTITY":"12","SHAW_QUANTITY":"11","DELTA_QUANTITY":"1"}` | 9c12…ab | 20260610000000 | OHB Nonserial Comparison |
+| PK_DERIVED | PART_NUMBER | STOCK_LOCATION_ID | DATA | FILE_DTTM |
+|---|---|---|---|---|
+| 3f8a…e1 | 0151000162 | OAK-A12 | `{"CTDI_COMP_DATE":"2026-06-10","SHAW_COMP_DATE":"2026-06-10","PARTTYPE":"STB","CTDI_QUANTITY":"5","SHAW_QUANTITY":"5","DELTA_QUANTITY":"0"}` | 2026-06-10 00:00:00 |
+| 9c12…ab | 0151000177 | OAK-B03 | `{"CTDI_COMP_DATE":"2026-06-10","SHAW_COMP_DATE":"2026-06-10","PARTTYPE":"MODEM","CTDI_QUANTITY":"12","SHAW_QUANTITY":"11","DELTA_QUANTITY":"1"}` | 2026-06-10 00:00:00 |
 
 ## Matching process_control row (one per tab)
 | column | value |
