@@ -95,7 +95,9 @@ DEFAULT_CONFIG = {
         "process_control": "drvd__app_bicc.bicc_process_control"
         # NOTE: load_type table removed - no longer required.
     },
-    "feed_file": {"excel_header": "true", "infer_schema": "false"},
+    # data_start_row = the 1-based row that holds the column HEADER. CTDI report exports put a
+    # title in row 1 and the real header in row 2, so default = 2. Set to 1 for plain sheets.
+    "feed_file": {"excel_header": "true", "infer_schema": "false", "data_start_row": 2},
     "email": {
         "sender": "${erp_email_sender}", "receivers": "${erp_email_receivers}",
         "server": "${erp_email_server}", "subject": "Failed | ERP - BICC Excel File INT 680"
@@ -221,17 +223,40 @@ def decrypt_gpg_files(src_path, scope_nm, decryption_key, passphrase_key):
 # COMMAND ----------
 
 # DBTITLE 1,File-name helpers (prefix / batch_id / file_dttm)
-# Derive the metadata key (file_name_prefix) and batch attributes from the file name,
-# exactly like the previous project (strip the -batch<n>-<dttm> suffix).
+# Derive the metadata key (file_name_prefix) and batch attributes from the file name.
+# Supports TWO naming conventions:
+#   (A) CTDI report exports : <Prefix>[._]YYYY.MM.DD[.HH.MM.SS]
+#         e.g. Rogers_Shaw_STB_OHB_Comparison_2026.06.10        -> prefix=Rogers_Shaw_STB_OHB_Comparison
+#              IssueTrackerDetails.2026.06.10.11.00.44           -> prefix=IssueTrackerDetails
+#   (B) BICC extract files  : <Prefix>-batch<n>-<YYYYMMDD_HHMMSS> (kept for backward-compat)
+# The prefix is the stable metadata key (date is stripped so it matches every run).
 
 def fn_parseFileName(file_path):
     file_name = os.path.basename(file_path)
     stem = os.path.splitext(file_name)[0]
-    file_name_prefix = re.sub(r'-batch[0-9]*-[0-9]*_[0-9]*', '', stem)
-    m = re.search(r'(?<=batch)[0-9]+-[0-9]+_[0-9]+', file_name)
     batch_id, file_dttm = None, None
+
+    # (A) CTDI date suffix
+    m = re.search(r'[._](\d{4}\.\d{2}\.\d{2}(?:\.\d{2}\.\d{2}\.\d{2})?)$', stem)
     if m:
-        batch_part, dttm_part = m.group(0).split('-')
+        date_token = m.group(1)
+        file_name_prefix = stem[:m.start()]
+        batch_id = date_token.replace('.', '')                  # 20260610 or 20260610110044
+        parts = date_token.split('.')
+        try:
+            if len(parts) >= 6:
+                file_dttm = datetime(*[int(p) for p in parts[:6]])
+            else:
+                file_dttm = datetime(int(parts[0]), int(parts[1]), int(parts[2]))
+        except Exception:
+            file_dttm = None
+        return file_name, file_name_prefix, batch_id, file_dttm
+
+    # (B) BICC -batch suffix (fallback)
+    file_name_prefix = re.sub(r'-batch[0-9]*-[0-9]*_[0-9]*', '', stem)
+    mb = re.search(r'(?<=batch)[0-9]+-[0-9]+_[0-9]+', file_name)
+    if mb:
+        batch_part, dttm_part = mb.group(0).split('-')
         batch_id = batch_part
         try:
             file_dttm = datetime.strptime(dttm_part, '%Y%m%d_%H%M%S')
@@ -266,13 +291,15 @@ def fn_getSheetMetadata(file_prefix, sheet_name, metadata_table):
 # (inferSchema=false) so we keep the data exactly as it appears (as-is). We then rename
 # sheet_column_name -> original_column_name using the metadata and keep column_order.
 
-def fn_readExcelSheet(file_path, sheet_name, meta_rows, header, infer_schema):
+def fn_readExcelSheet(file_path, sheet_name, meta_rows, header, infer_schema, data_start_row=2):
     try:
         status, errMsg = 0, 'Success'
+        # dataAddress 'Sheet'!A<row> => that row is the HEADER (CTDI reports put a title in row 1,
+        # so default row 2). With header=true, data begins on the following row.
         df = (spark.read.format("com.crealytics.spark.excel")
               .option("header", header)
               .option("inferSchema", infer_schema)
-              .option("dataAddress", f"'{sheet_name}'!A1")
+              .option("dataAddress", f"'{sheet_name}'!A{data_start_row}")
               .option("treatEmptyValuesAsNulls", "true")
               .option("usePlainNumberFormat", "true")     # avoid 1.0 / scientific notation on ids
               .option("addColorColumns", "false")
@@ -280,11 +307,23 @@ def fn_readExcelSheet(file_path, sheet_name, meta_rows, header, infer_schema):
 
         # Rename sheet header -> final/original column name, force string, keep metadata order.
         select_exprs = []
+        data_cols = []
         for m in meta_rows:
             src = m['sheet_column_name']
             tgt = m['original_column_name']
             select_exprs.append(col(f"`{src}`").cast('string').alias(tgt))
+            data_cols.append(tgt)
         df = df.select(*select_exprs)
+
+        # Drop FULLY-EMPTY rows. CTDI report exports end with a blank trailing row; without
+        # this, every file would raise a spurious NULL-PK failure (and a daily error email).
+        non_empty = None
+        for c in data_cols:
+            cond = col(c).isNotNull() & (col(c) != lit(''))
+            non_empty = cond if non_empty is None else (non_empty | cond)
+        if non_empty is not None:
+            df = df.filter(non_empty)
+
         df = df.withColumn('AZ_INPUT_FILE_NAME', lit(os.path.basename(file_path)))
     except Exception as e:
         status, df = 1, None
@@ -583,6 +622,7 @@ def fn_processSheet(execution_id, file_name, file_path, file_name_prefix, batch_
     error_table = notebook_config['validations']['error_table']
     header = notebook_config['feed_file'].get('excel_header', 'true')
     infer_schema = notebook_config['feed_file'].get('infer_schema', 'false')
+    data_start_row = notebook_config['feed_file'].get('data_start_row', 2)
 
     control = {
         'execution_id': execution_id, 'process_id': process_id, 'batch_id': batch_id,
@@ -602,7 +642,7 @@ def fn_processSheet(execution_id, file_name, file_path, file_name_prefix, batch_
             return control
 
         # 2) Read the sheet (as-is, all string)
-        status, df_sheet, errMsg = fn_readExcelSheet(file_path, sheet_tab_name, meta_rows, header, infer_schema)
+        status, df_sheet, errMsg = fn_readExcelSheet(file_path, sheet_tab_name, meta_rows, header, infer_schema, data_start_row)
         if status != 0:
             control['comments'] = errMsg
             return control
