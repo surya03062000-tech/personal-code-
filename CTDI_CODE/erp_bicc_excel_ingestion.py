@@ -85,6 +85,12 @@ TEST_EXCEL_PATH  = notebook_config['processing'].get('test_excel_path', '')
 # PROD: if source_path is set, the *.xlsx.gpg files are read from EXACTLY this folder (deterministic).
 #       if left blank, the code auto-discovers the latest dated folder under storage.source.
 SOURCE_PATH      = notebook_config['processing'].get('source_path', '')
+# OUTPUT base for parquet. Set this to write DIRECTLY (no dbutils.fs.mounts(), which is blocked on
+# Unity Catalog shared/standard clusters). Examples:
+#   abfss://raw@<account>.dfs.core.windows.net/erp     (prod, via external location)
+#   dbfs:/FileStore/erp_bicc_test/output               (local test, no ADLS creds)
+# If left blank, the code falls back to the mount-based fn_getLocation (only works on no-isolation clusters).
+OUTPUT_PATH      = notebook_config['processing'].get('output_path', '')
 HEADER_ROW_IDX   = int(notebook_config['processing'].get('header_row_index', 1))     # 0-based: 1 = 2nd row
 DATA_START_IDX   = int(notebook_config['processing'].get('data_start_row_index', 2)) # 0-based: 2 = 3rd row
 
@@ -433,17 +439,23 @@ def write_parquet(target_folder, table_name, df):
 
 # DBTITLE 1,Resolve the curated/raw output folder for a table (container/folder/table/yyyy/mm/dd/HH)
 def resolve_output_folder(table_name, kind='curated'):
-    adls_container = notebook_config['storage']['adls_container']
-    folder         = notebook_config['storage']['folder']
-    frequency      = notebook_config['storage']['frequency']
-    sub = table_name if kind == 'curated' else f"{table_name}/_raw_asis"
-    status, abfs_location, _, _, errMsg = fn_getLocation(adls_container, folder, sub)
-    if status != 0:
-        raise Exception(errMsg)
+    frequency = notebook_config['storage']['frequency']
     now = datetime.now()
     parts = {'monthly': ['%Y', '%m'], 'daily': ['%Y', '%m', '%d'],
              'hourly': ['%Y', '%m', '%d', '%H'], 'minutes': ['%Y', '%m', '%d', '%H', '%M']}
     dated = '/'.join(now.strftime(p) for p in parts.get(frequency.lower(), ['%Y', '%m', '%d']))
+    sub = table_name if kind == 'curated' else f"{table_name}/_raw_asis"
+
+    if OUTPUT_PATH:
+        # direct write - NO dbutils.fs.mounts() (works on Unity Catalog shared/standard clusters)
+        return f"{OUTPUT_PATH.rstrip('/')}/{sub}/{dated}"
+
+    # fallback: mount-based (needs dbutils.fs.mounts() -> only no-isolation clusters)
+    adls_container = notebook_config['storage']['adls_container']
+    folder         = notebook_config['storage']['folder']
+    status, abfs_location, _, _, errMsg = fn_getLocation(adls_container, folder, sub)
+    if status != 0:
+        raise Exception(errMsg)
     return f"{abfs_location}/{dated}"
 
 # COMMAND ----------
@@ -475,7 +487,15 @@ def send_failure_email(df_control):
     (auto-generated, do not reply - contact prodsuppazure@rci.rogers.com)<br></p>
     {failed.toPandas().to_html(index=False)}
     </body></html>"""
-    fn_sendEmail(cfg['sender'], cfg['server'], cfg['receivers'], subject, html)
+    # best-effort: a missing/unreachable SMTP server must not mask the real ingestion status
+    try:
+        if cfg.get('server') and not cfg['server'].startswith('${'):
+            fn_sendEmail(cfg['sender'], cfg['server'], cfg['receivers'], subject, html)
+            print('Failure e-mail sent.')
+        else:
+            print('SMTP server not configured - skipping e-mail (test mode).')
+    except Exception as e:
+        print(f'WARN: failure e-mail could not be sent ({e}). Continuing.')
 
 # COMMAND ----------
 
