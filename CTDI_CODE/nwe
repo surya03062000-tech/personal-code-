@@ -1,0 +1,15 @@
+Job starts at 2026-06-14 17:58:04
+Workbooks to process: ['Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx']
+==============================================================================================================
+Workbook: Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx | prefix=Rogers_Shaw_STB_OHB_Comparison | batch_id=20260610000000
+  - tab 'OHB Comparison' -> table 'ohb_comparison' | rows=539 | PK=['SERIAL_NUMBER', 'CTDI_SERIAL_NUMBER_ID']
+    !! Tab processing failed - Failed to get location (fn_getLocation). Error - ('Method public com.databricks.backend.daemon.dbutils.DBUtilsCore$Result com.databricks.backend.daemon.dbutils.DBUtilsCore.mounts() is not whitelisted on class class com.databricks.backend.daemon.dbutils.DBUtilsCore',)
+  - tab 'OHB Nonserial Comparison' -> table 'ohb_nonserial_comparison' | rows=36 | PK=['PART_NUMBER', 'STOCK_LOCATION_ID']
+    !! Tab processing failed - Failed to get location (fn_getLocation). Error - ('Method public com.databricks.backend.daemon.dbutils.DBUtilsCore$Result com.databricks.backend.daemon.dbutils.DBUtilsCore.mounts() is not whitelisted on class class com.databricks.backend.daemon.dbutils.DBUtilsCore',)
+{'jobStartDate': '2026-06-14 17:58:04',
+ 'message': 'Failed | Please debug - Error - [Errno -2] Name or service not '
+            'known',
+ 'messageDate': '2026-06-14 17:58:06',
+ 'name': 'erp_bicc_excel_ingestion (2)',
+ 'status': 1}
+Exception: Job failed. Please debug..
