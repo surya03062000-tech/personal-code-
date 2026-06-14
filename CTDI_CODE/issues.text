@@ -2,7 +2,7 @@
   "storage":    {"adls_container":"raw","folder":"erp","source":"bicc_INT_680","frequency":"hourly"},
   "decryption": {"private_key":"","scope_nm":"","passphrase_key":""},
   "processing": {"decrypt_flag":"false",
-                 "test_excel_path":"dbfs:/FileStore/erp_bicc_test/Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx",
+                 "test_excel_path":"dbfs:/FileStore/tables/Rogers_Shaw_STB_OHB_Comparison_2026_06_10.xlsx",
                  "source_path":"",
                  "header_row_index":"1",
                  "data_start_row_index":"2"},
