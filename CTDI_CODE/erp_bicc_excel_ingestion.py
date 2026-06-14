@@ -109,8 +109,10 @@ CURATED_META_COLS = ['FILE_DTTM', 'SOURCE_FILE_NAME', '_AZ_INSERT_TS']
 # Arrow makes pandas <-> Spark conversion (the excel read, #7) much faster.
 spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
-# E-mail subject is FIXED in code now (removed from the widget/config per request).
+# E-mail subject + signature are FIXED in code now (removed from the widget/config per request).
 EMAIL_SUBJECT = 'Failed | CTDI Excel File'
+EMAIL_TEAM    = 'Data & AI Team'
+EMAIL_CONTACT = 'prodsuppazure@rci.rogers.com'
 
 # exit_on_finish = "true"  (PROD/job): call dbutils.notebook.exit() so the orchestrator gets the JSON.
 # exit_on_finish = "false" (TEST)    : DON'T exit, so the *next cell* runs and can show the step log/summary.
@@ -548,41 +550,53 @@ def fn_sendEmail(sender, server, receivers, subject, html, port=25, debug=False)
     s.quit()
     return refused, ''
 
+def _esc(v):
+    """Minimal HTML escaping."""
+    return (str(v) if v is not None else '-').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
 def _build_failure_html(failed_rows):
-    """Advanced e-mail (your change #4): intro/contact text, THEN an error-details table."""
-    th = 'style="border:1px solid #888;padding:6px 10px;background:#c00020;color:#fff;text-align:left;"'
-    td = 'style="border:1px solid #888;padding:6px 10px;"'
+    """E-mail styled to match the reference: intro -> bordered table -> Thanks/team -> disclaimer."""
+    th  = ('border:1px solid #9a9a9a;background:#d9d9d9;color:#000;'
+           'padding:8px 14px;text-align:center;font-weight:bold;')
+    tdl = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:left;'      # left-aligned cell
+    tdc = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:center;'    # centered cell
+
     rows_html = ""
     for r in failed_rows:
+        bdate = r['file_dttm'].strftime('%Y-%m-%d') if r['file_dttm'] else '-'
         rows_html += (
-            f"<tr>"
-            f"<td {td}>{r['file_name']}</td>"
-            f"<td {td}>{r['table_name'] or '-'}</td>"
-            f"<td {td}>{r['sheet_tab_name'] or '-'}</td>"
-            f"<td {td} align='right'>{r['error_record_count']}</td>"
-            f"<td {td}>{(r['comments'] or '').replace('||', '<br>')}</td>"
-            f"</tr>"
+            "<tr>"
+            f"<td style='{tdl}'>{_esc(r['file_name'])}</td>"
+            f"<td style='{tdl}'>{_esc(r['table_name'])}</td>"
+            f"<td style='{tdl}'>{_esc(r['sheet_tab_name'])}</td>"
+            f"<td style='{tdc}'>{bdate}</td>"
+            f"<td style='{tdl}'>{_esc(r['comments'])}</td>"
+            f"<td style='{tdc};color:#c00000;font-weight:bold;'>E</td>"
+            "</tr>"
         )
+
     return f"""
-    <html><body style="font-family:Segoe UI,Arial,sans-serif;font-size:13px;color:#222;">
-      <p>Dear Team,<br><br>
-      The below ERP&nbsp;-&nbsp;BICC <b>Excel</b> feed(s) reported issues during ingestion.<br>
-      Full details: process control table <b>{PROCESS_CONTROL}</b>; errored records: <b>{ERROR_TABLE}</b>
-      (filter by the matching <i>process_id</i>).<br><br>
-      Thanks,<br>ED&amp;A Auto Email Alerts<br>
-      <span style="color:#666;">--------------------------------------------------------------<br>
-      Auto-generated e-mail - please do not reply.<br>
-      For support contact #RSO_BI Prod Supp - Azure : prodsuppazure@rci.rogers.com<br>
-      --------------------------------------------------------------</span>
-      </p>
-      <table style="border-collapse:collapse;font-size:12px;">
+    <div style="font-family:Calibri,Segoe UI,Arial,sans-serif;font-size:14px;color:#1f1f1f;">
+      <p><b>Dear Prod Support Team,</b></p>
+      <p>Please check the below feeds from <b>CTDI</b> that failed during control validation checks.<br>
+         Refer to control table - <b>{PROCESS_CONTROL}</b></p>
+      <p>Below are the error records:</p>
+      <table style="border-collapse:collapse;font-size:13px;">
         <tr>
-          <th {th}>File Name</th><th {th}>Table Name</th><th {th}>Sheet / Tab</th>
-          <th {th}>Error Records</th><th {th}>Error Reason</th>
+          <th style="{th}">FILE_NAME</th>
+          <th style="{th}">TABLE_NAME</th>
+          <th style="{th}">SHEET_TAB</th>
+          <th style="{th}">BUSINESS_DATE</th>
+          <th style="{th}">STATUS_TEXT</th>
+          <th style="{th}">STATUS</th>
         </tr>
         {rows_html}
       </table>
-    </body></html>"""
+      <p style="margin-top:18px;"><b>Thanks,</b><br>{EMAIL_TEAM}</p>
+      <hr style="border:none;border-top:1px solid #c8c8c8;width:520px;margin-left:0;">
+      <p style="font-size:12px;color:#555;">This is an auto-generated email. Please do not reply.<br>
+         Contact: <i>{EMAIL_CONTACT}</i></p>
+    </div>"""
 
 def send_failure_email(df_control):
     """ONE consolidated mail for ALL failed sheets/files in this run. Returns a status string."""
@@ -590,7 +604,7 @@ def send_failure_email(df_control):
     # collect every failed tab/file across the whole run -> a single e-mail
     failed_rows = df_control.filter(col('final_ingestion_status') != lit('Succeeded')) \
                             .select('file_name', 'table_name', 'sheet_tab_name',
-                                    'error_record_count', 'comments').collect()
+                                    'file_dttm', 'comments').collect()
     if not failed_rows:
         return 'No failures -> no e-mail sent'
 
