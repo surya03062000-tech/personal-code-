@@ -5,7 +5,7 @@
 # MAGIC
 # MAGIC **What this notebook does (high level)**
 # MAGIC 1. (Optional) GPG-decrypts the encrypted Excel files. Controlled by the `decrypt_process` flag so you can point straight at a sample `.xlsx` for testing.
-# MAGIC 2. Reads **every sheet/tab** of each Excel file using `com.crealytics.spark.excel` (Apache POI based — **no openpyxl**).
+# MAGIC 2. Reads **every sheet/tab** of each Excel file with the Python standard library (`zipfile` + `xml.etree`) — **no openpyxl, no spark-excel/JVM library** (works on Serverless).
 # MAGIC 3. Writes each sheet **as-is** to a raw Parquet (landing copy).
 # MAGIC 4. Looks up the **metadata table** to drive column names, data types and primary keys.
 # MAGIC 5. Runs **primary-key checks only**: duplicate PK, NULL PK, PK data-type. (No record-count check, no non-PK column checks.)
@@ -14,14 +14,15 @@
 # MAGIC
 # MAGIC > One file with 15 tabs = 15 independent table validations. If one tab fails, only that table's records go to the error table; the other tabs still succeed.
 # MAGIC
-# MAGIC **Cluster requirement:** install the Maven library `com.crealytics:spark-excel_2.12:<spark_ver>_<lib_ver>`
-# MAGIC (match your cluster Scala/Spark, e.g. `com.crealytics:spark-excel_2.12:3.5.1_0.20.4`).
+# MAGIC **No cluster libraries needed.** Excel is parsed with the Python standard library
+# MAGIC (`zipfile` + `xml.etree`) — no `openpyxl`, no `spark-excel` Maven/JVM dependency — so it
+# MAGIC runs on **Serverless / Spark Connect** and classic clusters alike.
 
 # COMMAND ----------
 
 # DBTITLE 1,Install libraries
-# Only python-gnupg is pip-installable. spark-excel is a JVM library and MUST be attached
-# to the cluster as a Maven coordinate (see header). We do not use openpyxl anywhere.
+# python-gnupg is only needed for the GPG decryption path (decrypt_process=true). Excel reading
+# uses the Python standard library only (zipfile + xml.etree) - no openpyxl, no spark-excel.
 
 import sys, subprocess, pkg_resources
 
@@ -37,7 +38,8 @@ if missing:
 # Single place for every import used in the notebook.
 
 import gnupg
-import json, os, re, base64, uuid, time
+import json, os, re, base64, uuid, time, zipfile
+from xml.etree import ElementTree as ET
 from datetime import datetime
 from pprint import pprint
 
@@ -286,34 +288,109 @@ def fn_getSheetMetadata(file_prefix, sheet_name, metadata_table):
 
 # COMMAND ----------
 
-# DBTITLE 1,Read one Excel sheet (spark-excel, no openpyxl)
-# Reads a single tab with com.crealytics.spark.excel. All columns are read as String
-# (inferSchema=false) so we keep the data exactly as it appears (as-is). We then rename
-# sheet_column_name -> original_column_name using the metadata and keep column_order.
+# DBTITLE 1,Read one Excel sheet (pure-Python stdlib, no openpyxl, no Maven/JVM lib)
+# .xlsx is a ZIP of XML. We parse it with the standard library (zipfile + xml.etree) so this
+# works on Serverless / Spark Connect where JVM data sources (spark-excel) cannot be installed.
+# All values are read as strings (as-is). For CTDI report files (hundreds-thousands of rows)
+# driver-side parsing is fine; for very large sheets prefer spark-excel on a classic cluster.
+
+_NS_MAIN = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+_NS_REL  = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+_NS_PKG  = '{http://schemas.openxmlformats.org/package/2006/relationships}'
+
+def fn_localPath(p):
+    # Make a Spark/DBFS path readable by zipfile (a local FUSE path).
+    if p.startswith('dbfs:/'):
+        return '/dbfs/' + p[len('dbfs:/'):]
+    return p                                   # /Volumes/... and /dbfs/... are already local
+
+def _colnum(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n
+
+def _read_shared_strings(z):
+    shared = []
+    if 'xl/sharedStrings.xml' in z.namelist():
+        root = ET.fromstring(z.read('xl/sharedStrings.xml'))
+        for si in root.findall(f'{_NS_MAIN}si'):
+            shared.append(''.join(t.text or '' for t in si.iter(f'{_NS_MAIN}t')))
+    return shared
+
+def _sheet_name_to_path(z):
+    wb = ET.fromstring(z.read('xl/workbook.xml'))
+    sheets = [(s.get('name'), s.get(f'{_NS_REL}id')) for s in wb.find(f'{_NS_MAIN}sheets')]
+    rels = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+    relmap = {r.get('Id'): r.get('Target') for r in rels.findall(f'{_NS_PKG}Relationship')}
+    out = {}
+    for name, rid in sheets:
+        tgt = relmap.get(rid, '')
+        tgt = tgt.lstrip('/').replace('../', '')
+        out[name] = tgt if tgt.startswith('xl/') else 'xl/' + tgt
+    return out
+
+def _cell_value(c, shared):
+    t = c.get('t')
+    if t == 'inlineStr':
+        is_ = c.find(f'{_NS_MAIN}is')
+        return ''.join(x.text or '' for x in is_.iter(f'{_NS_MAIN}t')) if is_ is not None else ''
+    v = c.find(f'{_NS_MAIN}v')
+    if v is None or v.text is None:
+        return ''
+    if t == 's':
+        return shared[int(v.text)]
+    return v.text                              # number / boolean / formula result, kept as string
+
+def _parse_sheet_rows(z, sheet_path, shared, header_row):
+    ws = ET.fromstring(z.read(sheet_path))
+    sd = ws.find(f'{_NS_MAIN}sheetData')
+    header_cells, data_rows, maxcol = {}, [], 0
+    for row in (sd.findall(f'{_NS_MAIN}row') if sd is not None else []):
+        r = int(row.get('r'))
+        if r < header_row:
+            continue
+        cells = {}
+        for c in row.findall(f'{_NS_MAIN}c'):
+            letters = re.match(r'[A-Z]+', c.get('r')).group(0)
+            cidx = _colnum(letters)
+            cells[cidx] = _cell_value(c, shared)
+            if cidx > maxcol:
+                maxcol = cidx
+        if r == header_row:
+            header_cells = cells
+        else:
+            data_rows.append(cells)
+    return header_cells, data_rows, maxcol
+
 
 def fn_readExcelSheet(file_path, sheet_name, meta_rows, header, infer_schema, data_start_row=2):
     try:
         status, errMsg = 0, 'Success'
-        # dataAddress 'Sheet'!A<row> => that row is the HEADER (CTDI reports put a title in row 1,
-        # so default row 2). With header=true, data begins on the following row.
-        df = (spark.read.format("com.crealytics.spark.excel")
-              .option("header", header)
-              .option("inferSchema", infer_schema)
-              .option("dataAddress", f"'{sheet_name}'!A{data_start_row}")
-              .option("treatEmptyValuesAsNulls", "true")
-              .option("usePlainNumberFormat", "true")     # avoid 1.0 / scientific notation on ids
-              .option("addColorColumns", "false")
-              .load(file_path))
+        local = fn_localPath(file_path)
+        with zipfile.ZipFile(local) as z:
+            shared = _read_shared_strings(z)
+            name_path = _sheet_name_to_path(z)
+            if sheet_name not in name_path:
+                raise Exception(f"Sheet '{sheet_name}' not found. Available: {list(name_path)}")
+            header_cells, data_rows, maxcol = _parse_sheet_rows(z, name_path[sheet_name], shared, data_start_row)
 
-        # Rename sheet header -> final/original column name, force string, keep metadata order.
-        select_exprs = []
-        data_cols = []
-        for m in meta_rows:
-            src = m['sheet_column_name']
-            tgt = m['original_column_name']
-            select_exprs.append(col(f"`{src}`").cast('string').alias(tgt))
-            data_cols.append(tgt)
-        df = df.select(*select_exprs)
+        # Map header text -> column index (header is on data_start_row; row 1 is the report title).
+        hdr_to_idx = {(v or '').strip(): k for k, v in header_cells.items()}
+        data_cols = [m['original_column_name'] for m in meta_rows]
+
+        # Build rows aligned to the metadata (sheet_column_name -> original_column_name), all string.
+        rows = []
+        for cells in data_rows:
+            rec = []
+            for m in meta_rows:
+                cidx = hdr_to_idx.get((m['sheet_column_name'] or '').strip())
+                val = cells.get(cidx) if cidx is not None else None
+                rec.append(val if (val is not None and val != '') else None)
+            rows.append(tuple(rec))
+
+        schema = StructType([StructField(c, StringType(), True) for c in data_cols])
+        df = spark.createDataFrame(rows, schema=schema) if rows else spark.createDataFrame([], schema=schema)
 
         # Drop FULLY-EMPTY rows. CTDI report exports end with a blank trailing row; without
         # this, every file would raise a spurious NULL-PK failure (and a daily error email).
