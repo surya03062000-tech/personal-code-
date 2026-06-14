@@ -1,15 +1,1 @@
-{
-  "storage":    {"adls_container":"raw","folder":"erp","source":"bicc_INT_680","frequency":"hourly"},
-  "decryption": {"private_key":"","scope_nm":"","passphrase_key":""},
-  "processing": {"decrypt_flag":"false",
-                 "test_excel_path":"/Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx",
-                 "source_path":"",
-                 "output_path":"/Volumes/edl_dev/rawstd__ela_stm/rawstd__stm",
-                 "header_row_index":"1",
-                 "data_start_row_index":"2"},
-  "validations":{"metadata_table":"drvd__app_ctdi.bicc_table_metadata",
-                 "error_table":"drvd__app_ctdi.bicc_ingestion_err_table",
-                 "process_control":"drvd__app_ctdi.bicc_process_control"},
-  "email":      {"sender":"${erp_email_sender}","receivers":"${erp_email_receivers}",
-                 "server":"${erp_email_server}","subject":"Failed | ERP - BICC Excel File INT 680"}
-}
+{   "storage":    {"adls_container":"raw","folder":"erp","source":"bicc_INT_680","frequency":"hourly"},   "decryption": {"private_key":"","scope_nm":"","passphrase_key":""},   "processing": {"decrypt_flag":"false",                  "test_excel_path":"/Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/Rogers_Shaw_STB_OHB_Comparison_2026.06.11.xlsx",                  "source_path":"",                  "output_path":"/Volumes/edl_dev/rawstd__ela_stm/rawstd__stm",                  "header_row_index":"1",                  "data_start_row_index":"2"},   "validations":{"metadata_table":"drvd__app_ctdi.bicc_table_metadata",                  "error_table":"drvd__app_ctdi.bicc_ingestion_err_table",                  "process_control":"drvd__app_ctdi.bicc_process_control"},   "email":      {"sender":"rogersbidatabricks@rci.rogers.com","receivers":"surya.alagarsamy@rci.rogers.com","server":"10.9.40.62","subject":"Failed | ERP - BICC Excel File INT 680"} }
