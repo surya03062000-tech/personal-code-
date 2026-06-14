@@ -1,99 +1,42 @@
--- =====================================================================================
--- ERP - BICC Excel Ingestion : DDLs + sample metadata for ONE file test
--- Catalog/schema: edl_prod.drvd__app_bicc
--- load_type table is intentionally REMOVED (no longer required).
--- =====================================================================================
-
-
--- -------------------------------------------------------------------------------------
--- 1) METADATA TABLE  (drives sheet list, column mapping, data types, primary keys)
---    New columns vs the old table:
---      sheet_tab_name        -> the Excel tab name to read
---      sheet_column_name     -> the header as it appears IN the sheet
---      original_column_name  -> the column name to use in the final table (can differ)
---      array_column_name     -> the key used for this column inside the JSON DATA column
---    is_nullable is kept ONLY because the NULL-PK check needs it (required column).
--- -------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_table_metadata (
-    serial_number          BIGINT,
-    batch_id               STRING,
-    file_name_prefix       STRING,
-    sheet_tab_name         STRING,
-    table_name             STRING,
-    sheet_column_name      STRING,
-    original_column_name   STRING,
-    array_column_name      STRING,
-    column_order           INT,
-    data_type              STRING,
-    is_primary_key         BOOLEAN,
-    is_nullable            BOOLEAN,
-    _az_insert_ts          TIMESTAMP,
-    _az_update_ts          TIMESTAMP
-) USING DELTA;
-
-
--- -------------------------------------------------------------------------------------
--- 2) PROCESS CONTROL  (one row PER TAB / TABLE per file)
---      raw_parquet_path            -> as-is sheet->parquet landing path  (your "csv file name")
---      dq_check_validation         -> ARRAY of the three PK check results
---      final_parquet_source_raw    -> final parquet path/status for the table
---      final_ingestion_status      -> Succeeded only when all DQ checks pass
---      comments                    -> failure reason when not Succeeded
---    record_count / error_count / batch_id / file_dttm added as useful standards.
--- -------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_process_control (
-    execution_id               STRING,
-    process_id                 STRING,
-    batch_id                   STRING,
-    file_name                  STRING,
-    sheet_tab_name             STRING,
-    table_name                 STRING,
-    raw_parquet_path           STRING,
-    dq_check_validation        ARRAY<STRING>,
-    record_count               BIGINT,
-    error_count                BIGINT,
-    final_parquet_source_raw   STRING,
-    final_ingestion_status     STRING,
-    comments                   STRING,
-    file_dttm                  TIMESTAMP,
-    _az_insert_ts              TIMESTAMP
-) USING DELTA;
-
-
--- -------------------------------------------------------------------------------------
--- 3) ERROR TABLE  (same columns/order as before + TABLE_NAME added)
--- -------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS edl_prod.drvd__app_bicc.bicc_ingestion_err_table (
-    EXECUTION_ID    STRING,
-    PROCESS_ID      STRING,
-    FILE_NAME       STRING,
-    TABLE_NAME      STRING,
-    FILE_PATH       STRING,
-    ERR_RECORD      STRING,
-    COMMENTS        STRING,
-    AZ_INSERT_TS    TIMESTAMP
-) USING DELTA;
-
-
--- =====================================================================================
--- SAMPLE METADATA ENTRIES FOR ONE FILE TEST
--- File          : file_erp_bicc_inv-batch240790827-20260614_100433.xlsx
--- file_prefix   : file_erp_bicc_inv   (derived by stripping -batch...-...)
--- Tabs (2)      : INV_HEADER -> inv_header , INV_DETAIL -> inv_detail
--- =====================================================================================
 INSERT INTO edl_prod.drvd__app_bicc.bicc_table_metadata
 (serial_number, batch_id, file_name_prefix, sheet_tab_name, table_name, sheet_column_name,
  original_column_name, array_column_name, column_order, data_type, is_primary_key, is_nullable,
  _az_insert_ts, _az_update_ts) VALUES
--- ---- Tab: INV_HEADER (PK = INVOICE_ID) ----
-(1,  '240790827', 'file_erp_bicc_inv', 'INV_HEADER', 'inv_header', 'Invoice Id',     'INVOICE_ID',   'invoice_id',   1, 'bigint',        true,  false, current_timestamp(), current_timestamp()),
-(2,  '240790827', 'file_erp_bicc_inv', 'INV_HEADER', 'inv_header', 'Invoice Number', 'INVOICE_NUM',  'invoice_num',  2, 'string',        false, true,  current_timestamp(), current_timestamp()),
-(3,  '240790827', 'file_erp_bicc_inv', 'INV_HEADER', 'inv_header', 'Invoice Date',   'INVOICE_DATE', 'invoice_date', 3, 'date',          false, true,  current_timestamp(), current_timestamp()),
-(4,  '240790827', 'file_erp_bicc_inv', 'INV_HEADER', 'inv_header', 'Amount',         'AMOUNT',       'amount',       4, 'decimal(18,2)', false, true,  current_timestamp(), current_timestamp()),
-(5,  '240790827', 'file_erp_bicc_inv', 'INV_HEADER', 'inv_header', 'Supplier Name',  'SUPPLIER_NAME','supplier_name',5, 'string',        false, true,  current_timestamp(), current_timestamp()),
--- ---- Tab: INV_DETAIL (composite PK = INVOICE_ID + LINE_ID) ----
-(6,  '240790827', 'file_erp_bicc_inv', 'INV_DETAIL', 'inv_detail', 'Invoice Id', 'INVOICE_ID', 'invoice_id', 1, 'bigint',        true,  false, current_timestamp(), current_timestamp()),
-(7,  '240790827', 'file_erp_bicc_inv', 'INV_DETAIL', 'inv_detail', 'Line Id',    'LINE_ID',    'line_id',    2, 'bigint',        true,  false, current_timestamp(), current_timestamp()),
-(8,  '240790827', 'file_erp_bicc_inv', 'INV_DETAIL', 'inv_detail', 'Item',       'ITEM',       'item',       3, 'string',        false, true,  current_timestamp(), current_timestamp()),
-(9,  '240790827', 'file_erp_bicc_inv', 'INV_DETAIL', 'inv_detail', 'Quantity',   'QTY',        'qty',        4, 'int',           false, true,  current_timestamp(), current_timestamp()),
-(10, '240790827', 'file_erp_bicc_inv', 'INV_DETAIL', 'inv_detail', 'Unit Price', 'UNIT_PRICE', 'unit_price', 5, 'decimal(18,2)', false, true,  current_timestamp(), current_timestamp());
+-- ---- Tab 1: 'OHB Comparison' -> ohb_comparison (PK = SERIAL_NUMBER) ----
+(1,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','ACTION','ACTION','action',1,'string',false,true,current_timestamp(),current_timestamp()),
+(2,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','CTDI_COMP_DATE','CTDI_COMP_DATE','ctdi_comp_date',2,'string',false,true,current_timestamp(),current_timestamp()),
+(3,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SHAW_COMP_DATE','SHAW_COMP_DATE','shaw_comp_date',3,'string',false,true,current_timestamp(),current_timestamp()),
+(4,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SERIAL_NUMBER','SERIAL_NUMBER','serial_number',4,'string',true,false,current_timestamp(),current_timestamp()),
+(5,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','ADDITIONAL1','ADDITIONAL1','additional1',5,'string',false,true,current_timestamp(),current_timestamp()),
+(6,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','COMPARISON','COMPARISON','comparison',6,'string',false,true,current_timestamp(),current_timestamp()),
+(7,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SHAW_STATION','SHAW_STATION','shaw_station',7,'string',false,true,current_timestamp(),current_timestamp()),
+(8,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SHAW_STOCK_LOCATION','SHAW_STOCK_LOCATION','shaw_stock_location',8,'string',false,true,current_timestamp(),current_timestamp()),
+(9,  '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','CTDI_STOCK_LOCATION','CTDI_STOCK_LOCATION','ctdi_stock_location',9,'string',false,true,current_timestamp(),current_timestamp()),
+(10, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','INVENTORY_CLASS','INVENTORY_CLASS','inventory_class',10,'string',false,true,current_timestamp(),current_timestamp()),
+(11, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','CTDI_SERIAL_NUMBER_ID','CTDI_SERIAL_NUMBER_ID','ctdi_serial_number_id',11,'string',false,true,current_timestamp(),current_timestamp()),
+(12, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','STATION_ID','STATION_ID','station_id',12,'string',false,true,current_timestamp(),current_timestamp()),
+(13, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','PALLET_ID','PALLET_ID','pallet_id',13,'string',false,true,current_timestamp(),current_timestamp()),
+(14, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','BIN_ID','BIN_ID','bin_id',14,'string',false,true,current_timestamp(),current_timestamp()),
+(15, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','PART_NUMBER','PART_NUMBER','part_number',15,'string',false,true,current_timestamp(),current_timestamp()),
+(16, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','PART_TYPE','PART_TYPE','part_type',16,'string',false,true,current_timestamp(),current_timestamp()),
+(17, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','RECEIVE_DATE','RECEIVE_DATE','receive_date',17,'string',false,true,current_timestamp(),current_timestamp()),
+(18, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','RECEIVE_YEAR_SORT','RECEIVE_YEAR_SORT','receive_year_sort',18,'string',false,true,current_timestamp(),current_timestamp()),
+(19, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','RECEIVE_RMA','RECEIVE_RMA','receive_rma',19,'string',false,true,current_timestamp(),current_timestamp()),
+(20, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','RECEIVE_LOCATION_ID','RECEIVE_LOCATION_ID','receive_location_id',20,'string',false,true,current_timestamp(),current_timestamp()),
+(21, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','RECEIVE_WAYBILL','RECEIVE_WAYBILL','receive_waybill',21,'string',false,true,current_timestamp(),current_timestamp()),
+(22, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SHIP_DATE','SHIP_DATE','ship_date',22,'string',false,true,current_timestamp(),current_timestamp()),
+(23, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SHIP_YEAR_SORT','SHIP_YEAR_SORT','ship_year_sort',23,'string',false,true,current_timestamp(),current_timestamp()),
+(24, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SHIP_WAYBILL','SHIP_WAYBILL','ship_waybill',24,'string',false,true,current_timestamp(),current_timestamp()),
+(25, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','SHIP_ORDER_NUMBER','SHIP_ORDER_NUMBER','ship_order_number',25,'string',false,true,current_timestamp(),current_timestamp()),
+(26, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','CUSTOMER_ORDER_NUMBER','CUSTOMER_ORDER_NUMBER','customer_order_number',26,'string',false,true,current_timestamp(),current_timestamp()),
+(27, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','ORDER_TYPE','ORDER_TYPE','order_type',27,'string',false,true,current_timestamp(),current_timestamp()),
+(28, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Comparison','ohb_comparison','RECEIVE_SHIP_YEAR_SORT','RECEIVE_SHIP_YEAR_SORT','receive_ship_year_sort',28,'string',false,true,current_timestamp(),current_timestamp()),
+-- ---- Tab 2: 'OHB Nonserial Comparison' -> ohb_nonserial_comparison (composite PK) ----
+(29, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','CTDI_COMP_DATE','CTDI_COMP_DATE','ctdi_comp_date',1,'string',false,true,current_timestamp(),current_timestamp()),
+(30, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','SHAW_COMP_DATE','SHAW_COMP_DATE','shaw_comp_date',2,'string',false,true,current_timestamp(),current_timestamp()),
+(31, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','PART_NUMBER','PART_NUMBER','part_number',3,'string',true,false,current_timestamp(),current_timestamp()),
+(32, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','STOCK_LOCATION_ID','STOCK_LOCATION_ID','stock_location_id',4,'string',true,false,current_timestamp(),current_timestamp()),
+(33, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','PARTTYPE','PARTTYPE','parttype',5,'string',true,false,current_timestamp(),current_timestamp()),
+(34, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','CTDI_QUANTITY','CTDI_QUANTITY','ctdi_quantity',6,'bigint',false,true,current_timestamp(),current_timestamp()),
+(35, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','SHAW_QUANTITY','SHAW_QUANTITY','shaw_quantity',7,'bigint',false,true,current_timestamp(),current_timestamp()),
+(36, '20260610','Rogers_Shaw_STB_OHB_Comparison','OHB Nonserial Comparison','ohb_nonserial_comparison','DELTA_QUANTITY','DELTA_QUANTITY','delta_quantity',8,'bigint',false,true,current_timestamp(),current_timestamp());
