@@ -73,7 +73,7 @@ dbutils.widgets.text('notebook_config', '')
 #                  "error_table":"drvd__app_bicc.bicc_ingestion_err_table",
 #                  "process_control":"drvd__app_bicc.bicc_process_control"},
 #   "email":      {"sender":"${erp_email_sender}","receivers":"${erp_email_receivers}",
-#                  "server":"${erp_email_server}","subject":"Failed | ERP - BICC Excel File INT 680"}
+#                  "server":"${erp_email_server}","port":"25"}   # NOTE: subject is fixed in code (EMAIL_SUBJECT)
 # }
 # ------------------------------------------------------------------------------------------------
 execution_id = dbutils.widgets.get('execution_id').strip() or f"LOCAL_{datetime.now().strftime('%Y%m%d%H%M%S')}"
@@ -108,6 +108,9 @@ CURATED_META_COLS = ['FILE_DTTM', 'SOURCE_FILE_NAME', '_AZ_INSERT_TS']
 # Arrow makes pandas <-> Spark conversion (the excel read, #7) much faster.
 spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
+# E-mail subject is FIXED in code now (removed from the widget/config per request).
+EMAIL_SUBJECT = 'Failed | CTDI Excel File'
+
 print(f"Mode={'PROD (decrypt)' if DECRYPT_FLAG else 'TEST (direct xlsx)'} | execution_id={execution_id}")
 
 # COMMAND ----------
@@ -120,7 +123,7 @@ def validate_config():
         'storage': ['adls_container', 'folder', 'source', 'frequency'],
         'processing': ['decrypt_flag'],
         'validations': ['metadata_table', 'error_table', 'process_control'],
-        'email': ['sender', 'receivers', 'server', 'subject'],
+        'email': ['sender', 'receivers', 'server'],   # subject is fixed in code now
     }
     for section, keys in required.items():
         if section not in notebook_config:
@@ -552,28 +555,30 @@ def _build_failure_html(failed_rows):
     </body></html>"""
 
 def send_failure_email(df_control):
+    """ONE consolidated mail for ALL failed sheets/files in this run. Returns a status string."""
     cfg = notebook_config['email']
+    # collect every failed tab/file across the whole run -> a single e-mail
     failed_rows = df_control.filter(col('final_ingestion_status') != lit('Succeeded')) \
                             .select('file_name', 'table_name', 'sheet_tab_name',
                                     'error_record_count', 'comments').collect()
     if not failed_rows:
-        print('No failures - no e-mail sent.')
-        return
-    subject = cfg['subject'] + ' | Run date - ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+        return 'No failures -> no e-mail sent'
+
+    subject = f"{EMAIL_SUBJECT} | {len(failed_rows)} failed | Run date - " \
+              f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
     html = _build_failure_html(failed_rows)
     server = cfg.get('server', '')
     # "email not sent" fix: only an unresolved ${placeholder} or blank host is skipped, and we say so loudly.
     if (not server) or server.startswith('${'):
-        print("EMAIL NOT SENT: email.server is blank or still a '${...}' placeholder. "
-              "Substitute the real SMTP host (e.g. 10.9.40.62) in config.email.server to send.")
-        return
+        return ("EMAIL NOT SENT: email.server is blank/placeholder - "
+                "set config.email.server to a reachable SMTP host (e.g. 10.9.40.62)")
     try:
         fn_sendEmail(cfg['sender'], server, cfg['receivers'], subject, html, cfg.get('port', 25))
-        print(f'Failure e-mail sent to {cfg["receivers"]} via {server}.')
+        return f'Failure e-mail SENT to {cfg["receivers"]} via {server} ({len(failed_rows)} failed sheet/file)'
     except Exception as e:
         # do NOT crash the job for an e-mail problem - report it clearly
-        print(f'EMAIL NOT SENT: SMTP send failed via {server} - {e}. '
-              f'Check cluster network access to the SMTP host and the sender/receiver values.')
+        return (f'EMAIL NOT SENT: SMTP send failed via {server} - {e}. '
+                f'Check cluster network access to the SMTP host and sender/receiver values')
 
 # COMMAND ----------
 
@@ -750,11 +755,32 @@ if __name__ == '__main__':
         try:
             if control_rows:
                 df_control = write_control_rows(control_rows)
-                n_failed = df_control.filter(col('final_ingestion_status') != lit('Succeeded')).count()
-                print(f'Control rows written: {len(control_rows)} | failed tabs/files: {n_failed}')
-                send_failure_email(df_control)   # job stays SUCCESS; failures are reported via control table + e-mail
+                # tuple layout: 3=file_name 4=sheet 5=table 12=err_cnt 13=status 14=comments
+                failed = [r for r in control_rows if r[13] != 'Succeeded']
+                n_ok, n_failed = len(control_rows) - len(failed), len(failed)
+                email_status = send_failure_email(df_control)   # ONE mail for all failures
+
+                # ---- human-readable summary printed to the cell output ----
+                print('=' * 110)
+                print(f'RUN SUMMARY : {n_ok} succeeded | {n_failed} FAILED')
+                for r in control_rows:
+                    print(f"  [{r[13]:9}] file={r[3]} | tab={r[4]} | table={r[5]} | "
+                          f"rows={r[10]} valid={r[11]} err={r[12]} | {r[14]}")
+                print(f'EMAIL : {email_status}')
+                print('=' * 110)
+
+                # ---- surface the failures in the EXIT message (job still SUCCESS) ----
+                if final_status == 0:
+                    if n_failed:
+                        details = " ;; ".join(
+                            f"{r[3]} -> {r[5] or r[4] or '-'} : {(r[14] or '').strip()}" for r in failed[:15])
+                        final_message = (f"Completed with FAILURES | {n_ok} ok, {n_failed} failed | "
+                                         f"{details} | EMAIL: {email_status}")
+                    else:
+                        final_message = f"Success | {n_ok} sheet(s) ingested, 0 failed | EMAIL: {email_status}"
             else:
-                print('No configured tabs were found to process.')
+                if final_status == 0:
+                    final_message = 'Success | No configured tabs were found to process.'
         except Exception as e:
             final_status, final_message = 1, 'Failed writing control table / e-mail - ' + str(e)
         df_metadata_all.unpersist()
