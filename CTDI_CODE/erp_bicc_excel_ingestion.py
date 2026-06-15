@@ -117,14 +117,14 @@ EMAIL_CONTACT = 'prodsuppazure@rci.rogers.com'
 # exit_on_finish = "true"  (PROD/job): call dbutils.notebook.exit() so the orchestrator gets the JSON.
 # exit_on_finish = "false" (TEST)    : DON'T exit, so the *next cell* runs and can show the step log/summary.
 EXIT_ON_FINISH = str(notebook_config['processing'].get('exit_on_finish', 'true')).lower() == 'true'
-EMAIL_VERBOSE  = str(notebook_config['email'].get('verbose', 'false')).lower() == 'true'
 
 # Step-by-step run log: every milestone is appended here AND printed live.
 # The "next cell" reads RUN_LOG / RUN_CONTROL_DF (populated only when exit_on_finish=false).
 RUN_LOG = []
 RUN_CONTROL_DF = None
 def log_step(msg, level='INFO'):
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] [{level}] {msg}"
+    tag = '' if level == 'INFO' else f"[{level}] "       # plain INFO lines (no [INFO] noise); WARN/SKIP keep a tag
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {tag}{msg}"
     RUN_LOG.append(line)
     print(line)
 
@@ -524,8 +524,8 @@ def resolve_output_folder(table_name, kind='curated'):
 # COMMAND ----------
 
 # DBTITLE 1,E-mail helpers
-def fn_sendEmail(sender, server, receivers, subject, html, port=25, debug=False):
-    """Returns (refused_dict, transcript). refused_dict == {} means the relay accepted for all recipients."""
+def fn_sendEmail(sender, server, receivers, subject, html, port=25):
+    """Returns refused_dict ({} == relay accepted for all recipients)."""
     msg = MIMEMultipart('alternative', None, [MIMEText('Please view this e-mail in HTML.'),
                                               MIMEText(html, 'html')])
     msg['Subject'] = subject
@@ -536,66 +536,56 @@ def fn_sendEmail(sender, server, receivers, subject, html, port=25, debug=False)
     msg['Message-ID'] = make_msgid(domain=sender.split('@')[-1])
 
     s = smtplib.SMTP(server, int(port), timeout=30)              # timeout so a bad host fails fast, not hangs
-    if debug:
-        import io, sys as _sys
-        buf = io.StringIO(); s.set_debuglevel(1)
-        old = _sys.stderr; _sys.stderr = buf                     # capture the SMTP conversation
-        try:
-            s.ehlo(); refused = s.sendmail(sender, rcpts, msg.as_string()); s.quit()
-        finally:
-            _sys.stderr = old
-        return refused, buf.getvalue()
     s.ehlo()
     refused = s.sendmail(sender, rcpts, msg.as_string())
     s.quit()
-    return refused, ''
+    return refused
 
 def _esc(v):
     """Minimal HTML escaping."""
     return (str(v) if v is not None else '-').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def _build_failure_html(failed_rows):
-    """E-mail styled to match the reference: intro -> bordered table -> Thanks/team -> disclaimer."""
+    """E-mail: intro -> bordered error table (5 cols) -> Thanks/team -> disclaimer/contact."""
     th  = ('border:1px solid #9a9a9a;background:#d9d9d9;color:#000;'
            'padding:8px 14px;text-align:center;font-weight:bold;')
-    tdl = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:left;'      # left-aligned cell
-    tdc = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:center;'    # centered cell
+    tdl = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:left;'
+    tdc = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:center;'
 
     rows_html = ""
     for r in failed_rows:
-        bdate = r['file_dttm'].strftime('%Y-%m-%d') if r['file_dttm'] else '-'
         rows_html += (
             "<tr>"
             f"<td style='{tdl}'>{_esc(r['file_name'])}</td>"
             f"<td style='{tdl}'>{_esc(r['table_name'])}</td>"
             f"<td style='{tdl}'>{_esc(r['sheet_tab_name'])}</td>"
-            f"<td style='{tdc}'>{bdate}</td>"
+            f"<td style='{tdc}'>{r['error_record_count']}</td>"
             f"<td style='{tdl}'>{_esc(r['comments'])}</td>"
-            f"<td style='{tdc};color:#c00000;font-weight:bold;'>E</td>"
             "</tr>"
         )
 
     return f"""
-    <div style="font-family:Calibri,Segoe UI,Arial,sans-serif;font-size:14px;color:#1f1f1f;">
-      <p><b>Dear Prod Support Team,</b></p>
-      <p>Please check the below feeds from <b>CTDI</b> that failed during control validation checks.<br>
-         Refer to control table - <b>{PROCESS_CONTROL}</b></p>
-      <p>Below are the error records:</p>
+    <div style="font-family:Calibri,Segoe UI,Arial,sans-serif;font-size:14px;color:#1f1f1f;line-height:1.5;">
+      <p style="margin:0 0 14px;"><b>Dear Prod Support Team,</b></p>
+      <p style="margin:0 0 14px;">Please check the below feeds from <b>CTDI Excel</b> that failed during ingestions.<br>
+         Refer to process control table - <b>{PROCESS_CONTROL}</b>; errored records:
+         <b>{ERROR_TABLE}</b> (filter by the matching <i>process_id</i>).</p>
       <table style="border-collapse:collapse;font-size:13px;">
         <tr>
-          <th style="{th}">FILE_NAME</th>
-          <th style="{th}">TABLE_NAME</th>
-          <th style="{th}">SHEET_TAB</th>
-          <th style="{th}">BUSINESS_DATE</th>
-          <th style="{th}">STATUS_TEXT</th>
-          <th style="{th}">STATUS</th>
+          <th style="{th}">File Name</th>
+          <th style="{th}">Table Name</th>
+          <th style="{th}">Sheet / Tab</th>
+          <th style="{th}">Error Records</th>
+          <th style="{th}">Error Reason</th>
         </tr>
         {rows_html}
       </table>
-      <p style="margin-top:18px;"><b>Thanks,</b><br>{EMAIL_TEAM}</p>
-      <hr style="border:none;border-top:1px solid #c8c8c8;width:520px;margin-left:0;">
-      <p style="font-size:12px;color:#555;">This is an auto-generated email. Please do not reply.<br>
-         Contact: <i>{EMAIL_CONTACT}</i></p>
+      <p style="margin:18px 0 4px;"><b>Thanks,</b><br>{EMAIL_TEAM}</p>
+      <hr style="border:none;border-top:1px solid #c8c8c8;width:520px;margin:12px 0 10px 0;">
+      <p style="font-size:12px;color:#555;margin:0;">
+         This is an auto-generated email. Please do not reply.<br>
+         For support, contact <b>Prod Support &ndash; Azure</b> :
+         <a href="mailto:{EMAIL_CONTACT}" style="color:#185fa5;">{EMAIL_CONTACT}</a></p>
     </div>"""
 
 def send_failure_email(df_control):
@@ -604,7 +594,7 @@ def send_failure_email(df_control):
     # collect every failed tab/file across the whole run -> a single e-mail
     failed_rows = df_control.filter(col('final_ingestion_status') != lit('Succeeded')) \
                             .select('file_name', 'table_name', 'sheet_tab_name',
-                                    'file_dttm', 'comments').collect()
+                                    'error_record_count', 'comments').collect()
     if not failed_rows:
         return 'No failures -> no e-mail sent'
 
@@ -617,19 +607,13 @@ def send_failure_email(df_control):
         return ("EMAIL NOT SENT: email.server is blank/placeholder - "
                 "set config.email.server to a reachable SMTP host (e.g. 10.9.40.62)")
     try:
-        refused, transcript = fn_sendEmail(cfg['sender'], server, cfg['receivers'],
-                                           subject, html, cfg.get('port', 25), debug=EMAIL_VERBOSE)
-        if EMAIL_VERBOSE and transcript:
-            print('----- SMTP transcript -----\n' + transcript + '\n---------------------------')
+        refused = fn_sendEmail(cfg['sender'], server, cfg['receivers'], subject, html, cfg.get('port', 25))
         if refused:
-            # relay accepted the connection but REJECTED these recipients -> real "not delivered" reason
-            return f'EMAIL PARTIALLY REFUSED by {server}: {refused} (relay rejected these recipients)'
-        return (f'Failure e-mail handed to relay {server} for {cfg["receivers"]} '
-                f'({len(failed_rows)} failed sheet/file). If not received: check spam + relay delivery policy.')
+            return f'EMAIL NOT DELIVERED: relay {server} refused {refused}'
+        return f'Failure e-mail sent to {cfg["receivers"]} ({len(failed_rows)} failed sheet/file)'
     except Exception as e:
-        # do NOT crash the job for an e-mail problem - report it clearly
-        return (f'EMAIL NOT SENT: SMTP send failed via {server} - {e}. '
-                f'Check cluster network access to the SMTP host and sender/receiver values')
+        # do NOT crash the job for an e-mail problem - report it concisely
+        return f'EMAIL NOT SENT: {e}'
 
 # COMMAND ----------
 
