@@ -38,8 +38,8 @@ from python_calamine import CalamineWorkbook
 
 from pyspark.sql import Window
 from pyspark.sql.functions import (
-    col, lit, when, expr, count, concat_ws, current_timestamp,
-    to_json, struct, sum as _sum
+    col, lit, when, expr, count, concat, concat_ws, current_timestamp,
+    to_json, struct, regexp_replace, sum as _sum
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, TimestampType, ArrayType, LongType
@@ -95,6 +95,9 @@ SOURCE_PATH      = notebook_config['processing'].get('source_path', '')
 OUTPUT_PATH      = notebook_config['processing'].get('output_path', '')
 HEADER_ROW_IDX   = int(notebook_config['processing'].get('header_row_index', 1))     # 0-based: 1 = 2nd row
 DATA_START_IDX   = int(notebook_config['processing'].get('data_start_row_index', 2)) # 0-based: 2 = 3rd row
+# The non-PK "data" column type. "variant" (default) absorbs schema drift (5 cols today, 10 tomorrow)
+# without changing the table. "json" = a JSON STRING fallback if the runtime can't write VARIANT to parquet.
+DATA_COLUMN_TYPE = notebook_config['processing'].get('data_column_type', 'variant').lower()
 
 METADATA_TABLE   = notebook_config['validations']['metadata_table']
 ERROR_TABLE      = notebook_config['validations']['error_table']
@@ -110,7 +113,7 @@ CURATED_META_COLS = ['FILE_DTTM', 'SOURCE_FILE_NAME', '_AZ_INSERT_TS']
 spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
 
 # E-mail subject + signature are FIXED in code now (removed from the widget/config per request).
-EMAIL_SUBJECT = 'Failed | CTDI Excel File'
+EMAIL_SUBJECT = 'ALERT | CTDI Excel Ingestion Failure'   # table name(s) get appended at send time
 EMAIL_TEAM    = 'Data & AI Team'
 EMAIL_CONTACT = 'prodsuppazure@rci.rogers.com'
 
@@ -303,11 +306,13 @@ df_metadata_all = spark.read.table(METADATA_TABLE).persist(StorageLevel.MEMORY_A
 df_metadata_all.count()  # materialize
 
 def get_sheet_metadata(file_prefix, sheet_tab_name):
-    """Return ordered list of metadata rows for one (file_prefix, sheet_tab). [] if not configured."""
+    """Return the PK-only metadata rows for one (file_prefix, sheet_tab). [] if not configured.
+       Metadata now holds ONLY the primary-key columns; order by serial_number keeps the
+       composite PK_DERIVED deterministic across runs."""
     rows = (df_metadata_all
             .filter((col('file_name_prefix') == lit(file_prefix)) &
                     (col('sheet_tab_name')   == lit(sheet_tab_name)))
-            .orderBy(col('column_order'))
+            .orderBy(col('serial_number'))
             .collect())
     return rows
 
@@ -373,19 +378,19 @@ def read_excel_sheets(local_path):
 
 # DBTITLE 1,Rename sheet columns -> original (final) column names from metadata
 def apply_column_mapping(df_sheet, meta_rows):
-    """sheet_column_name -> original_column_name. Keeps only configured columns, in column_order."""
-    select_exprs, ordered_final = [], []
-    sheet_cols = set(df_sheet.columns)
+    """Metadata now holds ONLY the PK columns. Rename each PK sheet column to its final
+       (original) name; keep EVERY other sheet column as-is (string) for the VARIANT bucket.
+       Returns (df, pk_final_cols, non_pk_cols)."""
+    rename, pk_final = {}, []
     for r in meta_rows:
         s_name = r['sheet_column_name']
-        f_name = r['original_column_name'] or r['sheet_column_name']
-        if s_name in sheet_cols:
-            select_exprs.append(col(f'`{s_name}`').alias(f_name))
-        else:
-            # configured column missing in the sheet -> create as NULL so downstream is stable
-            select_exprs.append(lit(None).cast('string').alias(f_name))
-        ordered_final.append(f_name)
-    return df_sheet.select(*select_exprs), ordered_final
+        f_name = r['original_column_name'] or s_name
+        rename[s_name] = f_name
+        pk_final.append(f_name)
+    select_exprs = [col(f'`{c}`').alias(rename.get(c, c)) for c in df_sheet.columns]
+    df = df_sheet.select(*select_exprs)
+    non_pk = [c for c in df.columns if c not in pk_final]
+    return df, pk_final, non_pk
 
 # COMMAND ----------
 
@@ -447,34 +452,57 @@ def run_pk_validations(df, pk_cols, pk_types):
 # COMMAND ----------
 
 # DBTITLE 1,Write bad records into the error table (same process_id for the whole tab)
-def insert_error_records(df_bad, process_id, file_name, table_name, sheet_tab_name, file_path):
-    err_cols = spark.read.table(ERROR_TABLE).columns  # written in the table's own column order
+def insert_error_records(df_bad, process_id, file_name, table_name, sheet_tab_name, file_path, pk_cols):
+    """Writes one detailed row per rejected record.  error_category = the failed check(s),
+       error_description = a full human-readable sentence, pk_value = the offending PK value(s),
+       err_record = the entire bad row as JSON."""
+    err_cols = spark.read.table(ERROR_TABLE).columns
+
+    category = regexp_replace(col('COMMENTS'), r'\s*\|\|\s*$', '')          # trim trailing " || "
+    pk_value = concat_ws(' | ', *[concat(lit(f'{c}='), col(f'`{c}`').cast('string')) for c in pk_cols]) \
+        if pk_cols else lit('(no PK configured)')
+
     df_err = (df_bad
-              .select(col('COMMENTS'), to_json(struct(col('*'))).alias('err_record'))
+              .withColumn('err_record', to_json(struct(col('*'))))          # full bad row first
+              .withColumn('error_category', category)
+              .withColumn('error_description',
+                          concat(lit('Record rejected during primary-key validation. Reason(s): '),
+                                 category,
+                                 lit('. Primary key -> '), pk_value,
+                                 lit('. Derived key = '), col('PK_DERIVED'),
+                                 lit('. This record was NOT ingested into the curated dataset.')))
+              .withColumn('pk_value', pk_value)
+              .withColumn('pk_derived', col('PK_DERIVED'))
               .withColumn('process_id', lit(process_id))
               .withColumn('execution_id', lit(execution_id))
               .withColumn('file_name', lit(file_name))
               .withColumn('table_name', lit(table_name))
               .withColumn('sheet_tab_name', lit(sheet_tab_name))
               .withColumn('file_path', lit(file_path))
+              .withColumn('comments', col('COMMENTS'))
               .withColumn('az_insert_ts', current_timestamp()))
     df_err.select(*err_cols).write.insertInto(ERROR_TABLE, overwrite=False)
 
 # COMMAND ----------
 
 # DBTITLE 1,Build the curated DF: PK as-is + all non-PK folded into one JSON column + metadata columns
-def build_curated_df(df_good, ordered_final, pk_cols, pk_types, array_col, file_dttm, source_file_name):
-    non_pk = [c for c in ordered_final if c not in pk_cols]
-
+def build_curated_df(df_good, non_pk_cols, pk_cols, pk_types, array_col, file_dttm, source_file_name):
     # PK columns kept as-is but cast to their declared datatype
     pk_select = [col(f'`{c}`').cast(t).alias(c) for c, t in zip(pk_cols, pk_types)]
 
-    # every non-PK column -> a single JSON object column (the "data"/array column from metadata)
-    json_col = to_json(struct(*[col(f'`{c}`').alias(c) for c in non_pk])).alias(array_col) if non_pk \
-        else lit('{}').alias(array_col)
+    # every non-PK column (kept as string) -> ONE semi-structured column.
+    #   VARIANT (default): absorbs schema drift - new/removed columns need no DDL or metadata change.
+    #   JSON   (fallback): a JSON string, for runtimes that can't write VARIANT to parquet.
+    if non_pk_cols:
+        struct_sql = "struct(" + ", ".join(f"`{c}`" for c in non_pk_cols) + ")"
+        data_col = (expr(f"parse_json(to_json({struct_sql}))") if DATA_COLUMN_TYPE == 'variant'
+                    else expr(f"to_json({struct_sql})")).alias(array_col)
+    else:
+        data_col = (expr("parse_json('{}')") if DATA_COLUMN_TYPE == 'variant'
+                    else lit('{}')).alias(array_col)
 
-    # PK_DERIVED FIRST, then PK cols, then DATA, then trailing metadata cols (your change #1)
-    df = df_good.select(col('PK_DERIVED'), *pk_select, json_col) \
+    # PK_DERIVED FIRST, then PK cols, then the VARIANT/JSON data col, then trailing metadata cols
+    df = df_good.select(col('PK_DERIVED'), *pk_select, data_col) \
                 .withColumn('FILE_DTTM', lit(file_dttm).cast(TimestampType())) \
                 .withColumn('SOURCE_FILE_NAME', lit(source_file_name)) \
                 .withColumn('_AZ_INSERT_TS', current_timestamp())
@@ -545,47 +573,94 @@ def _esc(v):
     """Minimal HTML escaping."""
     return (str(v) if v is not None else '-').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
-def _build_failure_html(failed_rows):
-    """E-mail: intro -> bordered error table (5 cols) -> Thanks/team -> disclaimer/contact."""
-    th  = ('border:1px solid #9a9a9a;background:#d9d9d9;color:#000;'
-           'padding:8px 14px;text-align:center;font-weight:bold;')
-    tdl = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:left;'
-    tdc = 'border:1px solid #9a9a9a;padding:7px 14px;text-align:center;'
+def _build_failure_html(failed_rows, exec_id):
+    """High-standard corporate alert e-mail (no emoji): accent strip -> dark header with severity pill
+       -> callout -> run-info panel -> zebra error table -> query box -> footer."""
+    th  = 'border:1px solid #9a1b2e;background:#b00020;color:#ffffff;padding:9px 12px;text-align:center;font-weight:600;'
+    tdl = 'border:1px solid #e4e4e4;padding:8px 12px;text-align:left;vertical-align:top;'
+    tdc = 'border:1px solid #e4e4e4;padding:8px 12px;text-align:center;vertical-align:top;'
+    tdr = 'border:1px solid #e4e4e4;padding:8px 12px;text-align:center;vertical-align:top;color:#b00020;font-weight:700;'
 
     rows_html = ""
-    for r in failed_rows:
+    for i, r in enumerate(failed_rows):
+        bg = '#ffffff' if i % 2 == 0 else '#f7f8f9'
         rows_html += (
-            "<tr>"
+            f"<tr style='background:{bg};'>"
             f"<td style='{tdl}'>{_esc(r['file_name'])}</td>"
-            f"<td style='{tdl}'>{_esc(r['table_name'])}</td>"
-            f"<td style='{tdl}'>{_esc(r['sheet_tab_name'])}</td>"
-            f"<td style='{tdc}'>{r['error_record_count']}</td>"
-            f"<td style='{tdl}'>{_esc(r['comments'])}</td>"
+            f"<td style='{tdl}'><b>{_esc(r['table_name'])}</b>"
+            f"<br><span style='font-size:11px;color:#888;'>{_esc(r['sheet_tab_name'])}</span></td>"
+            f"<td style='{tdl}color:#b00020;'>{_esc(r['comments'])}</td>"
+            f"<td style='{tdc}'>{r['source_row_count']}</td>"
+            f"<td style='{tdr}'>{r['error_record_count']}</td>"
+            f"<td style='{tdc}'>{r['valid_record_count']}</td>"
             "</tr>"
         )
 
+    query = f"SELECT * FROM {ERROR_TABLE} WHERE execution_id = '{exec_id}';"
+    run_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def info(label, value, vcolor='#1f2a36'):
+        return (f"<tr><td style='padding:7px 12px;border-bottom:1px solid #ededed;font-size:12px;color:#8a8a8a;width:140px;'>{label}</td>"
+                f"<td style='padding:7px 12px;border-bottom:1px solid #ededed;font-size:13px;color:{vcolor};font-weight:600;'>{value}</td></tr>")
+
     return f"""
-    <div style="font-family:Calibri,Segoe UI,Arial,sans-serif;font-size:14px;color:#1f1f1f;line-height:1.5;">
-      <p style="margin:0 0 14px;"><b>Dear Prod Support Team,</b></p>
-      <p style="margin:0 0 14px;">Please check the below feeds from <b>CTDI Excel</b> that failed during ingestions.<br>
-         Refer to process control table - <b>{PROCESS_CONTROL}</b>; errored records:
-         <b>{ERROR_TABLE}</b> (filter by the matching <i>process_id</i>).</p>
-      <table style="border-collapse:collapse;font-size:13px;">
-        <tr>
-          <th style="{th}">File Name</th>
-          <th style="{th}">Table Name</th>
-          <th style="{th}">Sheet / Tab</th>
-          <th style="{th}">Error Records</th>
-          <th style="{th}">Error Reason</th>
-        </tr>
-        {rows_html}
+    <div style="font-family:Segoe UI,Arial,sans-serif;color:#222;max-width:860px;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
+
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr><td bgcolor="#b00020" style="height:4px;line-height:4px;font-size:0;">&nbsp;</td></tr>
       </table>
-      <p style="margin:18px 0 4px;"><b>Thanks,</b><br>{EMAIL_TEAM}</p>
-      <hr style="border:none;border-top:1px solid #c8c8c8;width:520px;margin:12px 0 10px 0;">
-      <p style="font-size:12px;color:#555;margin:0;">
-         This is an auto-generated email. Please do not reply.<br>
-         For support, contact <b>Prod Support &ndash; Azure</b> :
-         <a href="mailto:{EMAIL_CONTACT}" style="color:#185fa5;">{EMAIL_CONTACT}</a></p>
+
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#1f2a36">
+        <tr>
+          <td bgcolor="#1f2a36" style="padding:16px 22px;">
+            <div style="color:#ffffff;font-size:19px;font-weight:600;letter-spacing:.3px;">Data Ingestion Alert</div>
+            <div style="color:#9fb0c0;font-size:12px;margin-top:3px;">ERP &middot; CTDI Excel Ingestion &middot; Automated Notification</div>
+          </td>
+          <td bgcolor="#1f2a36" align="right" style="padding:16px 22px;">
+            <span style="background:#b00020;color:#ffffff;font-size:11px;font-weight:700;letter-spacing:.6px;padding:5px 12px;border-radius:3px;">CRITICAL</span>
+          </td>
+        </tr>
+      </table>
+
+      <div style="padding:18px 22px;">
+        <div style="background:#fdecea;border-left:4px solid #b00020;padding:12px 16px;color:#7a1c12;font-size:13px;">
+          <b>Data validation irregularities have been detected during ingestion of one or more CTDI Excel feeds.</b>
+          This condition may impact downstream data reliability and requires immediate attention.
+        </div>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" style="margin:18px 0 4px;border-collapse:collapse;">
+          {info('Execution ID', _esc(exec_id))}
+          {info('Run Timestamp', run_date + ' UTC')}
+          {info('Failed Feeds', str(len(failed_rows)), '#b00020')}
+          {info('Control Table', PROCESS_CONTROL)}
+          {info('Error Table', ERROR_TABLE)}
+        </table>
+
+        <div style="font-weight:600;margin:20px 0 8px;font-size:14px;color:#1f2a36;">Error summary</div>
+        <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;width:100%;">
+          <tr>
+            <th style="{th}">File Name</th>
+            <th style="{th}">Table / Sheet</th>
+            <th style="{th}">Error Reason</th>
+            <th style="{th}">Total<br>Records</th>
+            <th style="{th}">Rejected</th>
+            <th style="{th}">Ingested</th>
+          </tr>
+          {rows_html}
+        </table>
+
+        <div style="font-weight:600;margin:22px 0 6px;font-size:14px;color:#1f2a36;">Next step</div>
+        <div style="font-size:13px;color:#444;margin-bottom:8px;">For detailed record-level errors, query the ingestion error table:</div>
+        <div style="background:#0f1b2a;color:#e6edf3;border-radius:4px;padding:11px 14px;font-family:Consolas,'Courier New',monospace;font-size:13px;">{_esc(query)}</div>
+
+        <div style="border-top:1px solid #e2e2e2;margin:24px 0 12px;"></div>
+        <div style="font-size:13px;color:#222;">Thanks,<br><b>{EMAIL_TEAM}</b></div>
+        <div style="font-size:11px;color:#8a8a8a;margin-top:14px;line-height:1.6;">
+          This is an automated notification from the ED&amp;A ingestion framework. Please do not reply to this email.<br>
+          For assistance, contact <b>Prod Support &ndash; Azure</b> &mdash;
+          <a href="mailto:{EMAIL_CONTACT}" style="color:#1f6feb;text-decoration:none;">{EMAIL_CONTACT}</a>
+        </div>
+      </div>
     </div>"""
 
 def send_failure_email(df_control):
@@ -594,13 +669,17 @@ def send_failure_email(df_control):
     # collect every failed tab/file across the whole run -> a single e-mail
     failed_rows = df_control.filter(col('final_ingestion_status') != lit('Succeeded')) \
                             .select('file_name', 'table_name', 'sheet_tab_name',
-                                    'error_record_count', 'comments').collect()
+                                    'source_row_count', 'valid_record_count', 'error_record_count',
+                                    'comments').collect()
     if not failed_rows:
         return 'No failures -> no e-mail sent'
 
-    subject = f"{EMAIL_SUBJECT} | {len(failed_rows)} failed | Run date - " \
-              f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-    html = _build_failure_html(failed_rows)
+    # subject includes the failed table name(s) (your request)
+    tables  = sorted({(r['table_name'] or '-') for r in failed_rows})
+    tbl_str = ', '.join(tables[:4]) + (' …' if len(tables) > 4 else '')
+    subject = f"{EMAIL_SUBJECT} | Table(s): {tbl_str} | {len(failed_rows)} failed | " \
+              f"Run date - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    html = _build_failure_html(failed_rows, execution_id)
     server = cfg.get('server', '')
     # "email not sent" fix: only an unresolved ${placeholder} or blank host is skipped, and we say so loudly.
     if (not server) or server.startswith('${'):
@@ -708,8 +787,10 @@ if __name__ == '__main__':
                 process_id = str(uuid.uuid4())
                 table_name = (meta_rows[0]['table_name'] or '').lower()
                 array_col  = meta_rows[0]['array_column_name'] or 'DATA'
-                pk_cols  = [r['original_column_name'] or r['sheet_column_name'] for r in meta_rows if r['is_primary_key']]
-                pk_types = [r['data_type'] for r in meta_rows if r['is_primary_key']]
+                # metadata now holds ONLY PK rows
+                pk_sheet_cols = [r['sheet_column_name'] for r in meta_rows]
+                pk_cols       = [r['original_column_name'] or r['sheet_column_name'] for r in meta_rows]
+                pk_types      = [r['data_type'] for r in meta_rows]
 
                 log_step(f"STEP 4 - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols}")
 
@@ -723,8 +804,7 @@ if __name__ == '__main__':
 
                     # #5: configured PK column must actually exist in the sheet - fail with a CLEAR reason
                     sheet_cols = set(df_sheet.columns)
-                    missing_pk = [r['sheet_column_name'] for r in meta_rows
-                                  if r['is_primary_key'] and r['sheet_column_name'] not in sheet_cols]
+                    missing_pk = [c for c in pk_sheet_cols if c not in sheet_cols]
                     if missing_pk:
                         raise Exception(f"Configured PK column(s) {missing_pk} not found in sheet "
                                         f"'{sheet_name}'. Sheet columns: {sorted(sheet_cols)}")
@@ -737,9 +817,9 @@ if __name__ == '__main__':
                     raw_path = write_parquet(raw_folder, table_name, df_sheet_persisted)
                     log_step(f"   STEP 4a - raw as-is parquet  -> {raw_path}")
 
-                    # (b) map sheet columns -> final names
-                    df_mapped, ordered_final = apply_column_mapping(df_sheet_persisted, meta_rows)
-                    log_step(f"   STEP 4b - columns mapped to final names ({len(ordered_final)} cols)")
+                    # (b) rename PK -> final names; every other sheet column stays for the VARIANT bucket
+                    df_mapped, pk_cols, non_pk_cols = apply_column_mapping(df_sheet_persisted, meta_rows)
+                    log_step(f"   STEP 4b - {len(pk_cols)} PK col(s) + {len(non_pk_cols)} data col(s) -> VARIANT")
 
                     # (c) PK-only validations (all checks run for every record)
                     df_val, dq_array, counts = run_pk_validations(df_mapped, pk_cols, pk_types)
@@ -748,15 +828,15 @@ if __name__ == '__main__':
                     log_step(f"   STEP 4c - PK checks done | dup={counts['dup']} null={counts['nul']} "
                              f"dtype={counts['dty']} -> bad={err_cnt}, good={valid_cnt}")
 
-                    # (d) bad records -> error table
+                    # (d) bad records -> error table (detailed)
                     if err_cnt > 0:
                         insert_error_records(df_val.where(col('COMMENTS') != lit('')),
-                                             process_id, file_name, table_name, sheet_name, src_path)
+                                             process_id, file_name, table_name, sheet_name, src_path, pk_cols)
                         log_step(f"   STEP 4d - {err_cnt} bad record(s) -> {ERROR_TABLE}", level='WARN')
 
-                    # (e) good records -> curated parquet (PK_DERIVED first + PK + JSON DATA + meta cols)
+                    # (e) good records -> curated parquet (PK_DERIVED first + PK + VARIANT data + meta cols)
                     df_good = df_val.where(col('COMMENTS') == lit('')).drop('COMMENTS')
-                    df_curated = build_curated_df(df_good, ordered_final, pk_cols, pk_types,
+                    df_curated = build_curated_df(df_good, non_pk_cols, pk_cols, pk_types,
                                                   array_col, file_dttm, file_name)
                     cur_folder = resolve_output_folder(table_name, kind='curated')
                     final_path = write_parquet(cur_folder, table_name, df_curated)

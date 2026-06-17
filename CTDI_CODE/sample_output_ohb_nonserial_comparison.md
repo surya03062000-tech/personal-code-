@@ -10,7 +10,7 @@ are appended.
 | 1 | `PK_DERIVED` | string | **first column** — md5(PART_NUMBER + STOCK_LOCATION_ID) |
 | 2 | `PART_NUMBER` | string | PK — kept as-is |
 | 3 | `STOCK_LOCATION_ID` | string | PK — kept as-is |
-| 4 | `DATA` | string (JSON) | all non-PK columns folded here (`array_column_name` from metadata) |
+| 4 | `DATA` | **variant** | all non-PK columns folded here as VARIANT (JSON string if `data_column_type=json`); absorbs schema drift — no metadata row per non-PK column |
 | 5 | `FILE_DTTM` | timestamp | parsed from file name |
 | 6 | `SOURCE_FILE_NAME` | string | `Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx` |
 | 7 | `_AZ_INSERT_TS` | timestamp | load time |
