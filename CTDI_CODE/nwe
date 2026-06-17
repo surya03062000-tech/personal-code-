@@ -1,12 +1,27 @@
-Dear Prod Support Team,
-
-Please check the below feeds from CTDI Excel that failed during ingestions.
-Refer to proces control table - drvd__app_ctdi.bicc_process_control; errored records: drvd__app_ctdi.bicc_ingestion_err_table (filter by the matching process_id).
-
-table only intha details matum pothum 
-File Name,Table Name,Sheet / Tab,Error Records,Error Reason
-Thanks,
-Data & AI Team
-
-This is an auto-generated email. Please do not reply.
-Contact: prodsuppazure@rci.rogers.com
+[00:36:39] STEP 1 - Job start (2026-06-17 00:36:39) | mode=TEST
+[00:36:39] STEP 2 - Workbooks to process: ['Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx']
+[00:36:39] STEP 3 - Reading workbook: Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx | prefix=Rogers_Shaw_STB_OHB_Comparison | batch_id=20260610000000
+[00:36:39] STEP 4 - tab 'OHB Comparison' -> table 'ohb_comparison' | rows=539 | PK=['ACTION', 'CTDI_COMP_DATE', 'SHAW_COMP_DATE', 'SERIAL_NUMBER', 'ADDITIONAL1', 'COMPARISON', 'SHAW_STATION', 'SHAW_STOCK_LOCATION', 'CTDI_STOCK_LOCATION', 'INVENTORY_CLASS', 'CTDI_SERIAL_NUMBER_ID', 'STATION_ID', 'PALLET_ID', 'BIN_ID', 'PART_NUMBER', 'PART_TYPE', 'RECEIVE_DATE', 'RECEIVE_YEAR_SORT', 'RECEIVE_RMA', 'RECEIVE_LOCATION_ID', 'RECEIVE_WAYBILL', 'SHIP_DATE', 'SHIP_YEAR_SORT', 'SHIP_WAYBILL', 'SHIP_ORDER_NUMBER', 'CUSTOMER_ORDER_NUMBER', 'ORDER_TYPE', 'RECEIVE_SHIP_YEAR_SORT']
+[00:36:41]    STEP 4a - raw as-is parquet  -> /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_comparison/_raw_asis/2026/06/17/00/ohb_comparison.parquet
+[00:36:41]    STEP 4b - 28 PK col(s) + 0 data col(s) -> VARIANT
+[00:36:43]    STEP 4c - PK checks done | dup=0 null=539 dtype=539 -> bad=539, good=0
+[00:36:48] [WARN]    STEP 4d - 539 bad record(s) -> drvd__app_ctdi.bicc_ingestion_err_table
+[00:36:49]    STEP 4e - curated parquet    -> /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_comparison/2026/06/17/00/ohb_comparison.parquet
+[00:36:50] STEP 4 - tab 'OHB Nonserial Comparison' -> table 'ohb_nonserial_comparison' | rows=36 | PK=['CTDI_COMP_DATE', 'SHAW_COMP_DATE', 'PART_NUMBER', 'STOCK_LOCATION_ID', 'PARTTYPE', 'CTDI_QUANTITY', 'SHAW_QUANTITY', 'DELTA_QUANTITY']
+[00:36:51]    STEP 4a - raw as-is parquet  -> /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_nonserial_comparison/_raw_asis/2026/06/17/00/ohb_nonserial_comparison.parquet
+[00:36:51]    STEP 4b - 8 PK col(s) + 0 data col(s) -> VARIANT
+[00:36:52]    STEP 4c - PK checks done | dup=0 null=1 dtype=36 -> bad=36, good=0
+[00:36:54] [WARN]    STEP 4d - 36 bad record(s) -> drvd__app_ctdi.bicc_ingestion_err_table
+[00:36:56]    STEP 4e - curated parquet    -> /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_nonserial_comparison/2026/06/17/00/ohb_nonserial_comparison.parquet
+[00:36:57] STEP 5 - 2 control row(s) written to drvd__app_ctdi.bicc_process_control
+[00:36:57] STEP 6 - Failure e-mail sent to surya.alagarsamy@rci.rogers.com,mariaxavier.rashwin@rci.rogers.com,Sree.Varsan@rci.rogers.com,Sneka.Velmurugan@rci.rogers.com (2 failed sheet/file)
+[00:36:57] ==========================================================================================
+[00:36:57] RUN SUMMARY : 0 succeeded | 2 FAILED
+[00:36:57]   [Failed   ] file=Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx | tab=OHB Comparison | table=ohb_comparison | rows=539 valid=0 err=539 | 539 record(s) failed PK validation -> drvd__app_ctdi.bicc_ingestion_err_table. Good records (0) written to /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_comparison/2026/06/17/00/ohb_comparison.parquet.
+[00:36:57]   [Failed   ] file=Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx | tab=OHB Nonserial Comparison | table=ohb_nonserial_comparison | rows=36 valid=0 err=36 | 36 record(s) failed PK validation -> drvd__app_ctdi.bicc_ingestion_err_table. Good records (0) written to /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_nonserial_comparison/2026/06/17/00/ohb_nonserial_comparison.parquet.
+[00:36:57] ==========================================================================================
+[00:36:57] exit_on_finish=false -> notebook NOT exited; run the NEXT cell for the step log & summary.
+{
+ "status": 0,
+ "message": "Completed with FAILURES | 0 ok, 2 failed | Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx -> ohb_comparison : 539 record(s) failed PK validation -> drvd__app_ctdi.bicc_ingestion_err_table. Good records (0) written to /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_comparison/2026/06/17/00/ohb_comparison.parquet. ;; Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx -> ohb_nonserial_comparison : 36 record(s) failed PK validation -> drvd__app_ctdi.bicc_ingestion_err_table. Good records (0) written to /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_nonserial_comparison/2026/06/17/00/ohb_nonserial_comparison.parquet. | EMAIL: Failure e-mail sent to surya.alagarsamy@rci.rogers.com,mariaxavier.rashwin@rci.rogers.com,Sree.Varsan@rci.rogers.com,Sneka.Velmurugan@rci.rogers.com (2 failed sheet/file)"
+}
