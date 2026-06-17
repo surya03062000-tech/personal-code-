@@ -126,8 +126,8 @@ EXIT_ON_FINISH = str(notebook_config['processing'].get('exit_on_finish', 'true')
 RUN_LOG = []
 RUN_CONTROL_DF = None
 def log_step(msg, level='INFO'):
-    tag = '' if level == 'INFO' else f"[{level}] "       # plain INFO lines (no [INFO] noise); WARN/SKIP keep a tag
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] {tag}{msg}"
+    tag = '' if level == 'INFO' else f"[{level}] "       # no timestamp; WARN/SKIP keep a tag
+    line = f"{tag}{msg}"
     RUN_LOG.append(line)
     print(line)
 
@@ -383,6 +383,8 @@ def apply_column_mapping(df_sheet, meta_rows):
        Returns (df, pk_final_cols, non_pk_cols)."""
     rename, pk_final = {}, []
     for r in meta_rows:
+        if not r['is_primary_key']:                 # only PK rows are renamed/validated
+            continue
         s_name = r['sheet_column_name']
         f_name = r['original_column_name'] or s_name
         rename[s_name] = f_name
@@ -576,20 +578,23 @@ def _esc(v):
 def _build_failure_html(failed_rows, exec_id):
     """High-standard corporate alert e-mail (no emoji): accent strip -> dark header with severity pill
        -> callout -> run-info panel -> zebra error table -> query box -> footer."""
-    th  = 'border:1px solid #9a1b2e;background:#b00020;color:#ffffff;padding:9px 12px;text-align:center;font-weight:600;'
-    tdl = 'border:1px solid #e4e4e4;padding:8px 12px;text-align:left;vertical-align:top;'
-    tdc = 'border:1px solid #e4e4e4;padding:8px 12px;text-align:center;vertical-align:top;'
-    tdr = 'border:1px solid #e4e4e4;padding:8px 12px;text-align:center;vertical-align:top;color:#b00020;font-weight:700;'
+    wrap = 'word-break:break-word;overflow-wrap:anywhere;'
+    th  = f'border:1px solid #9a1b2e;background:#b00020;color:#ffffff;padding:9px 10px;text-align:center;font-weight:600;{wrap}'
+    tdl = f'border:1px solid #e4e4e4;padding:8px 10px;text-align:left;vertical-align:top;{wrap}'
+    tdc = f'border:1px solid #e4e4e4;padding:8px 10px;text-align:center;vertical-align:top;{wrap}'
+    tdr = f'border:1px solid #e4e4e4;padding:8px 10px;text-align:center;vertical-align:top;color:#b00020;font-weight:700;{wrap}'
 
     rows_html = ""
     for i, r in enumerate(failed_rows):
         bg = '#ffffff' if i % 2 == 0 else '#f7f8f9'
+        # short, clean reason for the e-mail (drop the table-name / path tail that overflows)
+        reason = (r['comments'] or '').split(' -> ')[0].split('. Sheet columns')[0].strip()
         rows_html += (
             f"<tr style='background:{bg};'>"
             f"<td style='{tdl}'>{_esc(r['file_name'])}</td>"
             f"<td style='{tdl}'><b>{_esc(r['table_name'])}</b>"
             f"<br><span style='font-size:11px;color:#888;'>{_esc(r['sheet_tab_name'])}</span></td>"
-            f"<td style='{tdl}color:#b00020;'>{_esc(r['comments'])}</td>"
+            f"<td style='{tdl}color:#b00020;'>{_esc(reason)}</td>"
             f"<td style='{tdc}'>{r['source_row_count']}</td>"
             f"<td style='{tdr}'>{r['error_record_count']}</td>"
             f"<td style='{tdc}'>{r['valid_record_count']}</td>"
@@ -604,7 +609,7 @@ def _build_failure_html(failed_rows, exec_id):
                 f"<td style='padding:7px 12px;border-bottom:1px solid #ededed;font-size:13px;color:{vcolor};font-weight:600;'>{value}</td></tr>")
 
     return f"""
-    <div style="font-family:Segoe UI,Arial,sans-serif;color:#222;max-width:860px;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
+    <div style="font-family:Segoe UI,Arial,sans-serif;color:#222;width:100%;max-width:860px;border:1px solid #e0e0e0;border-radius:6px;overflow:hidden;">
 
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
         <tr><td bgcolor="#b00020" style="height:4px;line-height:4px;font-size:0;">&nbsp;</td></tr>
@@ -637,14 +642,14 @@ def _build_failure_html(failed_rows, exec_id):
         </table>
 
         <div style="font-weight:600;margin:20px 0 8px;font-size:14px;color:#1f2a36;">Error summary</div>
-        <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;width:100%;">
+        <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px;width:100%;table-layout:fixed;">
           <tr>
-            <th style="{th}">File Name</th>
-            <th style="{th}">Table / Sheet</th>
-            <th style="{th}">Error Reason</th>
-            <th style="{th}">Total<br>Records</th>
-            <th style="{th}">Rejected</th>
-            <th style="{th}">Ingested</th>
+            <th style="{th}width:24%;">File Name</th>
+            <th style="{th}width:18%;">Table / Sheet</th>
+            <th style="{th}width:28%;">Error Reason</th>
+            <th style="{th}width:10%;">Total</th>
+            <th style="{th}width:10%;">Rejected</th>
+            <th style="{th}width:10%;">Ingested</th>
           </tr>
           {rows_html}
         </table>
@@ -787,10 +792,11 @@ if __name__ == '__main__':
                 process_id = str(uuid.uuid4())
                 table_name = (meta_rows[0]['table_name'] or '').lower()
                 array_col  = meta_rows[0]['array_column_name'] or 'DATA'
-                # metadata now holds ONLY PK rows
-                pk_sheet_cols = [r['sheet_column_name'] for r in meta_rows]
-                pk_cols       = [r['original_column_name'] or r['sheet_column_name'] for r in meta_rows]
-                pk_types      = [r['data_type'] for r in meta_rows]
+                # only PK rows are validated (works whether metadata is PK-only or still has all columns)
+                pk_meta       = [r for r in meta_rows if r['is_primary_key']]
+                pk_sheet_cols = [r['sheet_column_name'] for r in pk_meta]
+                pk_cols       = [r['original_column_name'] or r['sheet_column_name'] for r in pk_meta]
+                pk_types      = [r['data_type'] for r in pk_meta]
 
                 log_step(f"STEP 4 - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols}")
 
