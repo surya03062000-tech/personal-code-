@@ -25,3 +25,6 @@
  "status": 0,
  "message": "Completed with FAILURES | 0 ok, 2 failed | Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx -> ohb_comparison : 539 record(s) failed PK validation -> drvd__app_ctdi.bicc_ingestion_err_table. Good records (0) written to /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_comparison/2026/06/17/00/ohb_comparison.parquet. ;; Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx -> ohb_nonserial_comparison : 36 record(s) failed PK validation -> drvd__app_ctdi.bicc_ingestion_err_table. Good records (0) written to /Volumes/edl_dev/rawstd__ela_stm/rawstd__stm/ohb_nonserial_comparison/2026/06/17/00/ohb_nonserial_comparison.parquet. | EMAIL: Failure e-mail sent to surya.alagarsamy@rci.rogers.com,mariaxavier.rashwin@rci.rogers.com,Sree.Varsan@rci.rogers.com,Sneka.Velmurugan@rci.rogers.com (2 failed sheet/file)"
 }
+
+
+
