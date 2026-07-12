@@ -103,11 +103,10 @@ METADATA_TABLE   = notebook_config['validations']['metadata_table']
 ERROR_TABLE      = notebook_config['validations']['error_table']
 PROCESS_CONTROL  = notebook_config['validations']['process_control']
 
-# Curated parquet layout (your change #1):
-#   PK_DERIVED (FIRST) , <pk columns...> , <DATA json> , then these trailing metadata columns.
-#   Removed from the parquet: BATCH_ID, SHEET_TAB_NAME, PROCESS_ID, EXECUTION_ID
-#   (they still live in the control / error tables for traceability).
-CURATED_META_COLS = ['FILE_DTTM', 'SOURCE_FILE_NAME', '_AZ_INSERT_TS']
+# Curated parquet layout:
+#   PK_DERIVED (FIRST) , <pk columns...> , <DATA> , DATA_KEYS , then these trailing metadata columns.
+#   AZ_INPUT_XLS_FILE_NAME = workbook file name | AZ_INPUT_XLS_TAB_NAME = excel tab name.
+CURATED_META_COLS = ['FILE_DTTM', 'AZ_INPUT_XLS_FILE_NAME', 'AZ_INPUT_XLS_TAB_NAME', '_AZ_INSERT_TS']
 
 # Arrow makes pandas <-> Spark conversion (the excel read, #7) much faster.
 spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
@@ -316,6 +315,13 @@ def get_sheet_metadata(file_prefix, sheet_tab_name):
             .collect())
     return rows
 
+def _meta_flag(row, name, default=True):
+    """Read an optional boolean column from a metadata Row - default when absent or NULL,
+       so the code keeps working on metadata tables created before the column existed."""
+    if name in row.__fields__ and row[name] is not None:
+        return bool(row[name])
+    return default
+
 # COMMAND ----------
 
 # DBTITLE 1,Read ALL sheets of one workbook with calamine -> list of (sheet_name, spark_df_as_string)
@@ -343,6 +349,13 @@ def read_excel_sheets(local_path):
     for sheet_name in wb.sheet_names:
         rows = wb.get_sheet_by_name(sheet_name).to_python(skip_empty_area=True)
         if len(rows) <= HEADER_ROW_IDX:
+            results.append((sheet_name, None, 0))
+            continue
+
+        # No-data placeholder: instead of real headers CTDI sends a single 'Report Status' header
+        # (banner / 'Report Status' / 'No Results for today'). Treat as an empty tab.
+        hdr_cells = [str(h).strip() for h in rows[HEADER_ROW_IDX] if h not in (None, '')]
+        if len(hdr_cells) == 1 and hdr_cells[0].lower() == 'report status':
             results.append((sheet_name, None, 0))
             continue
 
@@ -397,12 +410,29 @@ def apply_column_mapping(df_sheet, meta_rows):
 # COMMAND ----------
 
 # DBTITLE 1,Primary-Key-only validations: duplicate + NOT NULL + datatype  (NO count / non-PK checks)
-def run_pk_validations(df, pk_cols, pk_types):
+def run_pk_validations(df, pk_cols, pk_types, pk_nullable, load_type_delta, file_name, sheet_tab_name):
     """
-    ALL three PK checks run for EVERY record - no early exit, reasons accumulate (your change #3).
-    Each check is an explicit boolean flag column (#4) so the counts never depend on message text.
+    load_type_delta = True : all PK checks run for EVERY record (no early exit, reasons accumulate).
+                             The not-null check runs ONLY on PK columns whose is_nullable = true.
+    load_type_delta = False: NO PK validation at all; PK_DERIVED = md5 of ALL columns + metadata
+                             columns (file name + tab name) - full-load style.
     Returns (df_with_COMMENTS, dq_check_validation_array, counts_dict).
     """
+    if not load_type_delta:
+        parts = []
+        for c in df.columns:
+            parts.append(f"nvl(cast(`{c}` as string), '~')"); parts.append("'!@~'")
+        parts.append("'" + str(file_name).replace("'", "''") + "'"); parts.append("'!@~'")
+        parts.append("'" + str(sheet_tab_name).replace("'", "''") + "'")
+        df = df.withColumn('PK_DERIVED', expr("md5(concat(" + ", ".join(parts) + "))")) \
+               .withColumn('COMMENTS', lit(''))
+        df.persist(StorageLevel.DISK_ONLY)
+        counts = {'total': df.count(), 'dup': 0, 'nul': 0, 'dty': 0, 'bad': 0}
+        dq_array = ['Duplicate PK Check : SKIPPED | load_type_delta=false',
+                    'Not Null PK Check : SKIPPED | load_type_delta=false',
+                    'Data Type Check : SKIPPED | load_type_delta=false']
+        return df, dq_array, counts
+
     # 1) Derived PK (md5 of all PK columns) - composite-PK safe
     parts = []
     for c in pk_cols:
@@ -410,8 +440,9 @@ def run_pk_validations(df, pk_cols, pk_types):
     pk_expr = "md5(concat(" + ", ".join(parts) + ", '~'))" if pk_cols else "md5('~')"
     df = df.withColumn('PK_DERIVED', expr(pk_expr))
 
-    # 2) NOT-NULL flag  (any PK column null/blank)
-    null_cond = " OR ".join([f"(`{c}` IS NULL OR trim(`{c}`) = '')" for c in pk_cols]) if pk_cols else "false"
+    # 2) NOT-NULL flag - only PK columns with is_nullable = true are checked
+    null_chk_cols = [c for c, nf in zip(pk_cols, pk_nullable) if nf]
+    null_cond = " OR ".join([f"(`{c}` IS NULL OR trim(`{c}`) = '')" for c in null_chk_cols]) if null_chk_cols else "false"
     df = df.withColumn('_F_NULL', expr(null_cond))
 
     # 3) DATATYPE flag (non-string PK fails try_cast)
@@ -444,9 +475,11 @@ def run_pk_validations(df, pk_cols, pk_types):
 
     df = df.drop('_F_NULL', '_F_DTYPE', '_F_DUP', '_F_BAD')
 
+    null_line = (f"Not Null PK Check : {'PASS' if counts['nul'] == 0 else 'FAIL'} | null_records={counts['nul']}"
+                 if null_chk_cols else "Not Null PK Check : SKIPPED | is_nullable=false for all PK columns")
     dq_array = [
         f"Duplicate PK Check : {'PASS' if counts['dup'] == 0 else 'FAIL'} | duplicate_records={counts['dup']}",
-        f"Not Null PK Check : {'PASS' if counts['nul'] == 0 else 'FAIL'} | null_records={counts['nul']}",
+        null_line,
         f"Data Type Check : {'PASS' if counts['dty'] == 0 else 'FAIL'} | mismatch_records={counts['dty']}",
     ]
     return df, dq_array, counts
@@ -488,28 +521,36 @@ def insert_error_records(df_bad, process_id, file_name, table_name, sheet_tab_na
 # COMMAND ----------
 
 # DBTITLE 1,Build the curated DF: PK as-is + all non-PK folded into one JSON column + metadata columns
-def build_curated_df(df_good, non_pk_cols, pk_cols, pk_types, array_col, file_dttm, source_file_name):
+def build_curated_df(df_good, non_pk_cols, pk_cols, pk_types, array_col, file_dttm, source_file_name, sheet_tab_name):
     # PK columns kept as-is but cast to their declared datatype
     pk_select = [col(f'`{c}`').cast(t).alias(c) for c, t in zip(pk_cols, pk_types)]
 
     # every non-PK column (kept as string) -> ONE semi-structured column.
     #   VARIANT (default): absorbs schema drift - new/removed columns need no DDL or metadata change.
     #   JSON   (fallback): a JSON string, for runtimes that can't write VARIANT to parquet.
+    # ignoreNullFields=false -> a column whose value is NULL still appears in DATA (all-null columns kept).
     if non_pk_cols:
         struct_sql = "struct(" + ", ".join(f"`{c}`" for c in non_pk_cols) + ")"
-        data_col = (expr(f"parse_json(to_json({struct_sql}))") if DATA_COLUMN_TYPE == 'variant'
-                    else expr(f"to_json({struct_sql})")).alias(array_col)
+        json_sql = f"to_json({struct_sql}, map('ignoreNullFields', 'false'))"
+        data_col = (expr(f"parse_json({json_sql})") if DATA_COLUMN_TYPE == 'variant'
+                    else expr(json_sql)).alias(array_col)
     else:
         data_col = (expr("parse_json('{}')") if DATA_COLUMN_TYPE == 'variant'
                     else lit('{}')).alias(array_col)
 
-    # PK_DERIVED FIRST, then PK cols, then the VARIANT/JSON data col, then trailing metadata cols
-    df = df_good.select(col('PK_DERIVED'), *pk_select, data_col) \
+    # DATA_KEYS: the column NAMES inside DATA, as an array, in the same format as the data column
+    keys_json = json.dumps(non_pk_cols).replace("'", "\\'")
+    data_keys = (expr(f"parse_json('{keys_json}')") if DATA_COLUMN_TYPE == 'variant'
+                 else lit(json.dumps(non_pk_cols))).alias('DATA_KEYS')
+
+    # PK_DERIVED FIRST, then PK cols, then DATA + DATA_KEYS, then trailing metadata cols
+    df = df_good.select(col('PK_DERIVED'), *pk_select, data_col, data_keys) \
                 .withColumn('FILE_DTTM', lit(file_dttm).cast(TimestampType())) \
-                .withColumn('SOURCE_FILE_NAME', lit(source_file_name)) \
+                .withColumn('AZ_INPUT_XLS_FILE_NAME', lit(source_file_name)) \
+                .withColumn('AZ_INPUT_XLS_TAB_NAME', lit(sheet_tab_name)) \
                 .withColumn('_AZ_INSERT_TS', current_timestamp())
 
-    final_order = ['PK_DERIVED'] + pk_cols + [array_col] + CURATED_META_COLS
+    final_order = ['PK_DERIVED'] + pk_cols + [array_col, 'DATA_KEYS'] + CURATED_META_COLS
     return df.select(*final_order)
 
 # COMMAND ----------
@@ -797,18 +838,35 @@ if __name__ == '__main__':
                 pk_sheet_cols = [r['sheet_column_name'] for r in pk_meta]
                 pk_cols       = [r['original_column_name'] or r['sheet_column_name'] for r in pk_meta]
                 pk_types      = [r['data_type'] for r in pk_meta]
+                # new metadata flags - default True when the column is absent (old metadata) or NULL
+                pk_nullable     = [_meta_flag(r, 'is_nullable', True) for r in pk_meta]
+                load_type_delta = _meta_flag(meta_rows[0], 'load_type_delta', True)
 
-                log_step(f"STEP 4 - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols}")
+                log_step(f"STEP 4 - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols} "
+                         f"| load_type_delta={load_type_delta}")
+
+                # No-data tab (missing / 'Report Status' placeholder): control entry ONLY (0 records),
+                # NO raw / curated parquet, not a failure.
+                if df_sheet is None or raw_cnt == 0:
+                    comments = ('No data received for this tab (report returned no results). '
+                                'Parquet generation skipped.')
+                    log_step(f"   no data -> process-control entry only (0 records), no parquet", level='WARN')
+                    control_rows.append((
+                        execution_id, process_id, batch_id, file_name, sheet_name, table_name,
+                        src_path, None, None,
+                        ['Duplicate PK Check : NOT RUN | no data',
+                         'Not Null PK Check : NOT RUN | no data',
+                         'Data Type Check : NOT RUN | no data'],
+                        0, 0, 0, 'Succeeded', comments, file_dttm
+                    ))
+                    continue
 
                 raw_path, final_path, status_txt, comments = None, None, 'Failed', ''
                 dq_array, valid_cnt, err_cnt = list(NOT_RUN_DQ), 0, 0
                 df_sheet_persisted, df_val = None, None
 
                 try:
-                    if df_sheet is None or raw_cnt == 0:
-                        raise Exception('No data rows found in the sheet.')
-
-                    # #5: configured PK column must actually exist in the sheet - fail with a CLEAR reason
+                    # configured PK column must actually exist in the sheet - fail with a CLEAR reason
                     sheet_cols = set(df_sheet.columns)
                     missing_pk = [c for c in pk_sheet_cols if c not in sheet_cols]
                     if missing_pk:
@@ -825,10 +883,14 @@ if __name__ == '__main__':
 
                     # (b) rename PK -> final names; every other sheet column stays for the VARIANT bucket
                     df_mapped, pk_cols, non_pk_cols = apply_column_mapping(df_sheet_persisted, meta_rows)
-                    log_step(f"   STEP 4b - {len(pk_cols)} PK col(s) + {len(non_pk_cols)} data col(s) -> VARIANT")
+                    log_step(f"   STEP 4b - {len(pk_cols)} PK col(s) + {len(non_pk_cols)} data col(s) "
+                             f"-> {DATA_COLUMN_TYPE.upper()} + DATA_KEYS")
 
-                    # (c) PK-only validations (all checks run for every record)
-                    df_val, dq_array, counts = run_pk_validations(df_mapped, pk_cols, pk_types)
+                    # (c) PK validations (skipped entirely when load_type_delta=false;
+                    #     not-null check only on is_nullable=true PK columns)
+                    df_val, dq_array, counts = run_pk_validations(df_mapped, pk_cols, pk_types,
+                                                                  pk_nullable, load_type_delta,
+                                                                  file_name, sheet_name)
                     valid_cnt = counts['total'] - counts['bad']
                     err_cnt   = counts['bad']
                     log_step(f"   STEP 4c - PK checks done | dup={counts['dup']} null={counts['nul']} "
@@ -843,14 +905,15 @@ if __name__ == '__main__':
                     # (e) good records -> curated parquet (PK_DERIVED first + PK + VARIANT data + meta cols)
                     df_good = df_val.where(col('COMMENTS') == lit('')).drop('COMMENTS')
                     df_curated = build_curated_df(df_good, non_pk_cols, pk_cols, pk_types,
-                                                  array_col, file_dttm, file_name)
+                                                  array_col, file_dttm, file_name, sheet_name)
                     cur_folder = resolve_output_folder(table_name, kind='curated')
                     final_path = write_parquet(cur_folder, table_name, df_curated)
                     log_step(f"   STEP 4e - curated parquet    -> {final_path}")
 
                     if err_cnt == 0:
                         status_txt = 'Succeeded'
-                        comments   = 'All primary-key checks passed.'
+                        comments   = ('All primary-key checks passed.' if load_type_delta
+                                      else 'PK validation skipped (load_type_delta=false) - full load ingested.')
                     else:
                         status_txt = 'Failed'   # reported + e-mailed, but the JOB still succeeds (your change #2)
                         comments   = (f"{err_cnt} record(s) failed PK validation -> {ERROR_TABLE}. "

@@ -4,16 +4,21 @@ This is what **one curated `.parquet`** looks like for a single tab. PK columns 
 **every non-PK column is folded into the single JSON `DATA` column**, then the standard metadata columns
 are appended.
 
-## Schema of the curated parquet  (PK_DERIVED first; BATCH_ID / SHEET_TAB_NAME / PROCESS_ID / EXECUTION_ID removed)
+## Schema of the curated parquet  (PK_DERIVED first)
 | # | column | type | notes |
 |---|---|---|---|
-| 1 | `PK_DERIVED` | string | **first column** — md5(PART_NUMBER + STOCK_LOCATION_ID) |
+| 1 | `PK_DERIVED` | string | **first column** — md5(PK cols) when `load_type_delta=true`; md5(ALL columns + file name + tab name) when `false` |
 | 2 | `PART_NUMBER` | string | PK — kept as-is |
 | 3 | `STOCK_LOCATION_ID` | string | PK — kept as-is |
-| 4 | `DATA` | **variant** | all non-PK columns folded here as VARIANT (JSON string if `data_column_type=json`); absorbs schema drift — no metadata row per non-PK column |
-| 5 | `FILE_DTTM` | timestamp | parsed from file name |
-| 6 | `SOURCE_FILE_NAME` | string | `Rogers_Shaw_STB_OHB_Comparison_2026.06.10.xlsx` |
-| 7 | `_AZ_INSERT_TS` | timestamp | load time |
+| 4 | `DATA` | **variant** | all non-PK columns folded here as VARIANT (JSON string if `data_column_type=json`); null values kept (`ignoreNullFields=false`) so all-null columns still appear |
+| 5 | `DATA_KEYS` | **variant** | array of the column NAMES inside `DATA`, e.g. `["CTDI_COMP_DATE","PARTTYPE",…]` (same format as `DATA`) |
+| 6 | `FILE_DTTM` | timestamp | parsed from file name |
+| 7 | `AZ_INPUT_XLS_FILE_NAME` | string | workbook file name (renamed from SOURCE_FILE_NAME) |
+| 8 | `AZ_INPUT_XLS_TAB_NAME` | string | Excel tab name, e.g. `OHB Nonserial Comparison` |
+| 9 | `_AZ_INSERT_TS` | timestamp | load time |
+
+> **No-data tabs** (`Report Status` / `No Results for today` placeholder, or zero data rows): a full
+> process-control entry is written with 0 counts and status `Succeeded` — **no raw / curated parquet is created**.
 
 > `BATCH_ID`, `SHEET_TAB_NAME`, `PROCESS_ID`, `EXECUTION_ID` are **not** in the parquet anymore — they remain in `bicc_process_control` / `bicc_ingestion_err_table` for traceability.
 
