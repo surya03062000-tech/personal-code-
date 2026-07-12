@@ -837,14 +837,18 @@ if __name__ == '__main__':
                 process_id = str(uuid.uuid4())
                 table_name = (meta_rows[0]['table_name'] or '').lower()
                 array_col  = meta_rows[0]['array_column_name'] or 'DATA'
-                # only PK rows are validated (works whether metadata is PK-only or still has all columns)
-                pk_meta       = [r for r in meta_rows if r['is_primary_key']]
-                pk_sheet_cols = [r['sheet_column_name'] for r in pk_meta]
-                pk_cols       = [r['original_column_name'] or r['sheet_column_name'] for r in pk_meta]
-                pk_types      = [r['data_type'] for r in pk_meta]
-                # new metadata flags - default True when the column is absent (old metadata) or NULL
-                pk_nullable     = [_meta_flag(r, 'is_nullable', True) for r in pk_meta]
                 load_type_delta = _meta_flag(meta_rows[0], 'load_type_delta', True)
+                if load_type_delta:
+                    # DELTA load: pull the configured PK columns out and validate them
+                    pk_meta       = [r for r in meta_rows if r['is_primary_key']]
+                    pk_sheet_cols = [r['sheet_column_name'] for r in pk_meta]
+                    pk_cols       = [r['original_column_name'] or r['sheet_column_name'] for r in pk_meta]
+                    pk_types      = [r['data_type'] for r in pk_meta]
+                    pk_nullable   = [_meta_flag(r, 'is_nullable', True) for r in pk_meta]
+                else:
+                    # FULL load: ignore PK columns entirely - NO column is pulled out, EVERY column
+                    # goes into DATA, and PK_DERIVED = md5(all columns + file name + tab name).
+                    pk_sheet_cols, pk_cols, pk_types, pk_nullable = [], [], [], []
 
                 log_step(f"STEP 4 - tab '{sheet_name}' -> table '{table_name}' | rows={raw_cnt} | PK={pk_cols} "
                          f"| load_type_delta={load_type_delta}")
@@ -885,8 +889,12 @@ if __name__ == '__main__':
                     raw_path = write_parquet(raw_folder, table_name, df_sheet_persisted)
                     log_step(f"   STEP 4a - raw as-is parquet  -> {raw_path}")
 
-                    # (b) rename PK -> final names; every other sheet column stays for the VARIANT bucket
-                    df_mapped, pk_cols, non_pk_cols = apply_column_mapping(df_sheet_persisted, meta_rows)
+                    # (b) DELTA: rename PK -> final names, rest goes to DATA.
+                    #     FULL: no rename, no PK pulled out - EVERY sheet column goes to DATA.
+                    if load_type_delta:
+                        df_mapped, pk_cols, non_pk_cols = apply_column_mapping(df_sheet_persisted, meta_rows)
+                    else:
+                        df_mapped, non_pk_cols = df_sheet_persisted, list(df_sheet_persisted.columns)
                     log_step(f"   STEP 4b - {len(pk_cols)} PK col(s) + {len(non_pk_cols)} data col(s) "
                              f"-> {DATA_COLUMN_TYPE.upper()} + DATA_KEYS")
 
