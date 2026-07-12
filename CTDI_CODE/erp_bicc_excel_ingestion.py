@@ -161,8 +161,9 @@ def validate_config():
         if not (SOURCE_PATH or notebook_config['storage'].get('source')):
             problems.append("PROD mode needs processing.source_path or storage.source")
     else:
-        if not TEST_EXCEL_PATH:
-            problems.append("TEST mode needs processing.test_excel_path")
+        if not (TEST_EXCEL_PATH or SOURCE_PATH):
+            problems.append("TEST mode needs processing.test_excel_path (single file) "
+                            "or processing.source_path (folder of plain xlsx)")
 
     # the three control tables must exist and be readable
     for t in [METADATA_TABLE, ERROR_TABLE, PROCESS_CONTROL]:
@@ -179,14 +180,20 @@ validate_config()
 
 # COMMAND ----------
 
-# DBTITLE 1,Util - dbfs:/ <-> /dbfs path helpers (calamine reads from the local FUSE path)
-def to_local_path(path):
-    """abfss is not directly readable by calamine; dbfs:/ and /mnt are exposed under /dbfs."""
+# DBTITLE 1,Util - make any path locally readable for calamine (copies abfss:// to driver disk)
+def materialize_local(path):
+    """calamine needs a LOCAL filesystem path. dbfs:/, /dbfs, /Volumes, /mnt are already local (FUSE).
+       abfss:// / wasbs:// are NOT locally readable -> copy the file to driver-local disk first.
+       Returns (local_path, is_temp). Caller deletes the temp copy when is_temp is True."""
     if path.startswith('dbfs:/'):
-        return path.replace('dbfs:/', '/dbfs/', 1)
-    if path.startswith('/dbfs/') or path.startswith('/'):
-        return path
-    return path
+        return path.replace('dbfs:/', '/dbfs/', 1), False
+    if path.startswith('/'):                       # /dbfs, /Volumes, /mnt, or a plain local path
+        return path, False
+    # cloud URL (abfss://, wasbs://, https://) -> stage a local copy
+    os.makedirs('/tmp/ctdi_ingest', exist_ok=True)
+    dst = f"file:/tmp/ctdi_ingest/{uuid.uuid4().hex}_{os.path.basename(path)}"
+    dbutils.fs.cp(path, dst)                        # needs a UC external location / credential on the account
+    return dst.replace('file:', '', 1), True
 
 # COMMAND ----------
 
@@ -342,12 +349,24 @@ def cell_to_str(v):
     s = str(v)
     return None if s == '' else s
 
-def read_excel_sheets(local_path):
+def read_excel_sheets(path):
     """
     Reads every tab. Header is taken from HEADER_ROW_IDX (2nd row for CTDI files, which have a
     title banner on row 1). Everything is read as STRING - we cast later only for PK datatype checks.
+    `path` may be dbfs:/, /dbfs, /Volumes, /mnt or abfss:// (abfss is staged to local disk first).
     Returns: list of (sheet_name, df_string_or_None, raw_row_count)
     """
+    local_path, is_temp = materialize_local(path)
+    try:
+        return _read_excel_sheets_local(local_path)
+    finally:
+        if is_temp:
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+
+def _read_excel_sheets_local(local_path):
     wb = CalamineWorkbook.from_path(local_path)
     results = []
     for sheet_name in wb.sheet_names:
@@ -751,11 +770,19 @@ def send_failure_email(df_control):
 
 # DBTITLE 1,Build the list of workbooks to process (TEST = direct path | PROD = decrypted dated folder)
 def list_workbooks():
-    """Returns list of (abfss_or_dbfs_path, local_path, file_name)."""
+    """Returns list of (display_path, read_path, file_name). read_path is materialized to local
+       inside read_excel_sheets (so abfss:// works)."""
     if not DECRYPT_FLAG:
-        # TEST MODE - read the provided xlsx directly, no GPG.
+        # TEST MODE - no GPG.
+        if SOURCE_PATH:
+            # FOLDER test: source_path holds already-decrypted plain *.xlsx (as prod would leave them
+            # after decryption). Process EVERY workbook in the folder - no GPG, no test_excel_path.
+            print(f'TEST (folder, no decrypt) - listing *.xlsx under source_path: {SOURCE_PATH}')
+            files = dbutils.fs.ls(SOURCE_PATH)
+            return [(f.path, f.path, f.name) for f in files if f.name.lower().endswith('.xlsx')]
+        # SINGLE-FILE test: read the one workbook at test_excel_path.
         p = TEST_EXCEL_PATH
-        return [(p, to_local_path(p), os.path.basename(p))]
+        return [(p, p, os.path.basename(p))]
 
     # PROD MODE - decrypt *.xlsx.gpg, then list *.xlsx
     adls_container = notebook_config['storage']['adls_container']
@@ -778,7 +805,7 @@ def list_workbooks():
     wbs = []
     for f in files:
         if f.name.lower().endswith('.xlsx'):
-            wbs.append((f.path, f.path.replace('dbfs:/', '/dbfs/', 1), f.name))
+            wbs.append((f.path, f.path, f.name))   # read_path materialized in read_excel_sheets
     return wbs
 
 # COMMAND ----------
