@@ -582,7 +582,10 @@ def resolve_output_folder(table_name, kind='curated'):
     parts = {'monthly': ['%Y', '%m'], 'daily': ['%Y', '%m', '%d'],
              'hourly': ['%Y', '%m', '%d', '%H'], 'minutes': ['%Y', '%m', '%d', '%H', '%M']}
     dated = '/'.join(now.strftime(p) for p in parts.get(frequency.lower(), ['%Y', '%m', '%d']))
-    sub = table_name if kind == 'curated' else f"{table_name}/_raw_asis"
+    # Two output zones:
+    #   raw  (as-is landing)          -> <base>/<table>/_raw_asis/<dated>   (unchanged)
+    #   curated (post-validation)     -> <base>/raw_ctdi/<table>/<dated>    (final, consumable)
+    sub = f"raw_ctdi/{table_name}" if kind == 'curated' else f"{table_name}/_raw_asis"
 
     if OUTPUT_PATH:
         # direct write - NO dbutils.fs.mounts() (works on Unity Catalog shared/standard clusters)
