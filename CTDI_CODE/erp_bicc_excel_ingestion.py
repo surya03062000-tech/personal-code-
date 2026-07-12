@@ -95,9 +95,13 @@ SOURCE_PATH      = notebook_config['processing'].get('source_path', '')
 OUTPUT_PATH      = notebook_config['processing'].get('output_path', '')
 HEADER_ROW_IDX   = int(notebook_config['processing'].get('header_row_index', 1))     # 0-based: 1 = 2nd row
 DATA_START_IDX   = int(notebook_config['processing'].get('data_start_row_index', 2)) # 0-based: 2 = 3rd row
-# The non-PK "data" column type. "variant" (default) absorbs schema drift (5 cols today, 10 tomorrow)
-# without changing the table. "json" = a JSON STRING fallback if the runtime can't write VARIANT to parquet.
-DATA_COLUMN_TYPE = notebook_config['processing'].get('data_column_type', 'variant').lower()
+# The non-PK "data" column type in the OUTPUT PARQUET.
+#   "json" (default) : DATA / DATA_KEYS are readable JSON strings - portable to any parquet reader.
+#                      Convert to VARIANT downstream in the Delta load:  parse_json(DATA)
+#   "variant"        : writes real VARIANT columns. NOTE: parquet stores VARIANT as BINARY
+#                      metadata/value fields - external viewers / non-variant readers show binary,
+#                      so use this only when the consumer is DBR 15.3+ reading with variant support.
+DATA_COLUMN_TYPE = notebook_config['processing'].get('data_column_type', 'json').lower()
 
 METADATA_TABLE   = notebook_config['validations']['metadata_table']
 ERROR_TABLE      = notebook_config['validations']['error_table']
