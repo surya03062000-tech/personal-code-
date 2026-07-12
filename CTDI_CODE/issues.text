@@ -1,5 +1,8 @@
-ALTER TABLE drvd__app_ctdi.bicc_table_metadata
-  ADD COLUMNS (is_nullable BOOLEAN, load_type_delta BOOLEAN);
-UPDATE drvd__app_ctdi.bicc_table_metadata
-  SET is_nullable = true, load_type_delta = true
-  WHERE is_nullable IS NULL OR load_type_delta IS NULL;
+"processing": {
+  "decrypt_flag":"false",
+  "source_path":"abfss://raw@<account>.dfs.core.windows.net/erp/bicc_INT_680/2026/07/13/10",
+  "test_excel_path":"",
+  "output_path":"abfss://raw@<account>.dfs.core.windows.net/erp",
+  "exit_on_finish":"false",
+  "header_row_index":"1","data_start_row_index":"2"
+}
