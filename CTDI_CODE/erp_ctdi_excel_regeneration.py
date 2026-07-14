@@ -183,31 +183,44 @@ expected_count = (latest_ctrl['valid_record_count'] if latest_ctrl and latest_ct
 
 # COMMAND ----------
 
-# DBTITLE 1,STEP 4 - Read the curated table + detect DATA column physical type (json string vs variant)
+# DBTITLE 1,STEP 4 - Read the curated table, keep ONLY the latest batch (max FILE_DTTM), detect DATA type
 full_table = f"{RAWSTD_SCHEMA}.{input_table_name}"
 if not spark.catalog.tableExists(full_table):
     raise Exception(f"Table '{full_table}' does not exist - has it been loaded yet?")
 
-df_full = spark.read.table(full_table)
-dtypes = dict(df_full.dtypes)
+df_all_batches = spark.read.table(full_table)
+dtypes = dict(df_all_batches.dtypes)
 
 if array_col not in dtypes:
     raise Exception(f"Column '{array_col}' (array_column_name from metadata) not found in {full_table}. "
-                    f"Available columns: {df_full.columns}")
+                    f"Available columns: {df_all_batches.columns}")
 if 'DATA_KEYS' not in dtypes:
     raise Exception(f"Column 'DATA_KEYS' not found in {full_table} - cannot reconstruct original columns.")
+if 'FILE_DTTM' not in dtypes:
+    raise Exception(f"Column 'FILE_DTTM' not found in {full_table} - cannot isolate the latest batch.")
 
 IS_VARIANT = dtypes[array_col] == 'variant'
+
+max_file_dttm_row = df_all_batches.agg(F.max('FILE_DTTM').alias('m')).collect()[0]
+max_file_dttm = max_file_dttm_row['m']
+if max_file_dttm is None:
+    log_step(f"{full_table} has no rows at all (FILE_DTTM is entirely NULL/table empty) - "
+             f"treating as a headers-only regeneration.", level='WARN')
+    df_full = df_all_batches.limit(0)
+else:
+    df_full = df_all_batches.where(col('FILE_DTTM') == lit(max_file_dttm))
+
 actual_count = df_full.count()
-log_step(f"STEP 4 - Read {full_table} | rows={actual_count} | DATA column type={dtypes[array_col]}")
+log_step(f"STEP 4 - Read {full_table} | latest FILE_DTTM={max_file_dttm} | rows in that batch={actual_count} "
+         f"(table total={df_all_batches.count()}) | DATA column type={dtypes[array_col]}")
 
 if expected_count is not None and actual_count != expected_count:
-    log_step(f"rawstd row count ({actual_count}) differs from latest process-control "
-             f"expected count ({expected_count}) - table may have changed since that run", level='WARN')
+    log_step(f"latest-batch row count ({actual_count}) differs from the latest process-control "
+             f"expected count ({expected_count}) - check FILE_DTTM alignment with that run", level='WARN')
 
 if actual_count > MAX_ROWS:
-    raise Exception(f"{full_table} has {actual_count} rows, over the configured max_rows_to_regenerate "
-                    f"({MAX_ROWS}). Raise processing.max_rows_to_regenerate if this is expected.")
+    raise Exception(f"Latest batch of {full_table} has {actual_count} rows, over the configured "
+                    f"max_rows_to_regenerate ({MAX_ROWS}). Raise processing.max_rows_to_regenerate if expected.")
 
 # COMMAND ----------
 
