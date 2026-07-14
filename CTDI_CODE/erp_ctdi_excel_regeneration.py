@@ -44,6 +44,7 @@ import pandas as pd
 
 from pyspark.sql import functions as F
 from pyspark.sql.functions import col, lit, expr
+from pyspark.sql.types import MapType, StringType
 
 # COMMAND ----------
 
@@ -247,17 +248,14 @@ log_step(f"STEP 5 - DATA_KEYS discovered: {data_keys}")
 
 # COMMAND ----------
 
-# DBTITLE 1,STEP 6 - Build the final column list + extraction expressions
-def _json_path_key(key):
-    return key.replace('\\', '\\\\').replace('"', '\\"')
+# DBTITLE 1,STEP 6 - Build the final column list (MAP-based extraction - no per-key JSONPath parsing)
+# get_json_object()/try_variant_get() with a quoted path string ($."KEY") is fragile in Spark's
+# JSONPath grammar and can silently return NULL for every key. Parsing DATA into a MAP<STRING,STRING>
+# ONCE and doing plain key lookups avoids path-string escaping entirely and is far more reliable.
 
-def extract_value_expr(is_variant, array_col, key):
-    """One non-PK value out of DATA, as a string - works for both storage modes."""
-    path = f'$."{_json_path_key(key)}"'
-    if is_variant:
-        safe_path = path.replace("'", "''")
-        return expr(f"try_variant_get(`{array_col}`, '{safe_path}', 'string')").alias(key)
-    return F.get_json_object(col(f'`{array_col}`'), path).alias(key)
+# DATA as a canonical JSON STRING regardless of storage mode (VARIANT -> its JSON text via CAST)
+data_json_col = expr(f"cast(`{array_col}` as string)") if IS_VARIANT else col(f'`{array_col}`')
+df_full = df_full.withColumn('__DATA_MAP__', F.from_json(data_json_col, MapType(StringType(), StringType())))
 
 non_pk_keys = [k for k in data_keys if k not in pk_cols]
 
@@ -267,7 +265,7 @@ if load_type_delta:
     for c in pk_cols:
         select_exprs.append(col(f'`{c}`').alias(c))
 for k in non_pk_keys:
-    select_exprs.append(extract_value_expr(IS_VARIANT, array_col, k))
+    select_exprs.append(col('__DATA_MAP__').getItem(k).alias(k))
 
 final_columns = (pk_cols if load_type_delta else []) + non_pk_keys
 log_step(f"STEP 6 - Final Excel column order ({len(final_columns)}): {final_columns}")
